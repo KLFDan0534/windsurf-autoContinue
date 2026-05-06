@@ -1,0 +1,16 @@
+# 已注入的 workbench.html 参考文件（含完整Windsurf源码，体积大且不宜公开）
+源码.html
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
