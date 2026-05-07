@@ -2123,14 +2123,15 @@
 				return;
 			}
 
-			// 二次验证：确认最后消息内确实有 lucide-triangle-alert 图标和 bg-red-600 样式
-			// 真实DOM结构: div[data-step-index] > div > div.bg-red-600 > svg.lucide-triangle-alert + span
+			// 二次验证：确认最后消息内确实有 lucide-triangle-alert 图标和配额提示样式
+			// 真实DOM结构(新UI): div[data-step-index] > div > div.bg-neutral-500/20 > svg.lucide-triangle-alert + span
+			// 真实DOM结构(旧UI): div[data-step-index] > div > div.bg-red-600 > svg.lucide-triangle-alert + span
 			const hasAlertIcon = lastStep.querySelector('svg.lucide-triangle-alert');
-			const hasRedBg = lastStep.querySelector('[class*="bg-red-600"], [class*="bg-red-500"]');
-			console.log(LOG_PREFIX + '[AutoContinue] 🔍二次验证: alertIcon=' + !!hasAlertIcon + ', redBg=' + !!hasRedBg);
-			if (!hasAlertIcon && !hasRedBg) {
+			const hasQuotaBg = lastStep.querySelector('[class*="bg-neutral-500/20"], [class*="bg-red-600"], [class*="bg-red-500"]');
+			console.log(LOG_PREFIX + '[AutoContinue] 🔍二次验证: alertIcon=' + !!hasAlertIcon + ', quotaBg=' + !!hasQuotaBg);
+			if (!hasAlertIcon && !hasQuotaBg) {
 				// 兜底：文本匹配已通过，可能UI结构变化，仍然继续但记录警告
-				console.log(LOG_PREFIX + '[AutoContinue] ⚠️无triangle-alert/red-600图标，但文本匹配通过，继续发送');
+				console.log(LOG_PREFIX + '[AutoContinue] ⚠️无triangle-alert/quotaBg图标，但文本匹配通过，继续发送');
 			}
 
 			// 执行发送"继续"的逻辑（含重试）
@@ -2147,19 +2148,31 @@
 					}
 
 					// 检查是否已有排队的"继续"消息（避免重复发送）
-					// 真实DOM: span文本含 "message queued" / "messages queued" / "条消息排队中"
+					// 真实DOM: <span>1 message queued</span> + 排队内容在 div.truncate.text-sm.opacity-80
 					const chatRoot2 = findChatRoot() || document;
+					// 方法1: 找 "N message(s) queued" span，检查同区域是否有"继续"
 					const allSpans = chatRoot2.querySelectorAll('span');
 					for (const span of allSpans) {
 						const spanText = (span.textContent || '').toLowerCase();
 						if (spanText.includes('message queued') || spanText.includes('messages queued') || spanText.includes('条消息排队中')) {
-							// 找到排队提示文本，检查同一区域是否含"继续"
-							const container = span.closest('div[class*="flex"]') || span.parentElement;
-							if (container && container.textContent.includes('继续')) {
-								console.log(LOG_PREFIX + '[AutoContinue] 已有排队的"继续"消息，跳过');
+							// 找到排队提示，检查整个排队区域是否含"继续"
+							// 真实DOM: span在 div.flex.flex-col.py-px 里，同层有排队的消息div
+							const queueArea = span.closest('div.flex.flex-col') || span.closest('[class*="flex-col"]') || span.parentElement?.parentElement;
+							if (queueArea && queueArea.textContent.includes('继续')) {
+								console.log(LOG_PREFIX + '[AutoContinue] 已有排队的"继续"消息(queueArea)，跳过');
 								_quotaContinueCooldown = false;
 								return;
 							}
+						}
+					}
+					// 方法2: 找输入框placeholder含"排队"或"queued"
+					const placeholders = chatRoot2.querySelectorAll('span.truncate, [class*="truncate"]');
+					for (const p of placeholders) {
+						const pText = (p.textContent || '').toLowerCase();
+						if (pText.includes('queued') || pText.includes('排队')) {
+							console.log(LOG_PREFIX + '[AutoContinue] 输入框显示排队提示，可能有排队消息，跳过');
+							_quotaContinueCooldown = false;
+							return;
 						}
 					}
 
