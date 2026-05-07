@@ -18,6 +18,8 @@
 		localizationEnabled: true,
 		// 自动继续
 		autoContinueEnabled: true,
+		// 多轮对话队列
+		chatQueueEnabled: true,
 		// 完成提示音
 		notificationSoundEnabled: true,
 		notificationSoundPreset: 'chime',
@@ -53,6 +55,9 @@
 		'textarea',
 	];
 	const SEND_BTN_CANDIDATES = [
+		// 真实确认: submit按钮内含svg.lucide-arrow-up
+		'button[type="submit"]',
+		// 以下为猜测兜底
 		'button[data-tooltip-id*="send"]',
 		'button[aria-label*="Send"]',
 		'button[aria-label*="send"]',
@@ -1656,7 +1661,77 @@
 		acEnable.appendChild(acCheck);
 		acEnable.appendChild(document.createTextNode(' 回复截断时自动继续'));
 		acSection.appendChild(acEnable);
-		
+
+		// 多轮对话队列
+		const cqEnable = document.createElement('label');
+		const cqCheck = document.createElement('input');
+		cqCheck.type = 'checkbox';
+		cqCheck.checked = settings.chatQueueEnabled;
+		cqCheck.addEventListener('change', () => {
+			settings.chatQueueEnabled = cqCheck.checked;
+			saveSettings(settings);
+			updateQueueUI();
+		});
+		cqEnable.appendChild(cqCheck);
+		cqEnable.appendChild(document.createTextNode(' 多轮对话队列'));
+		acSection.appendChild(cqEnable);
+
+		// 队列输入区
+		const cqBox = document.createElement('div');
+		cqBox.id = 'ws-cq-box';
+		cqBox.style.cssText = 'margin-top:8px;display:none;';
+		const cqInput = document.createElement('textarea');
+		cqInput.id = 'ws-cq-input';
+		cqInput.placeholder = '每行一条对话，按顺序执行\n例如:\n帮我写一个函数\n帮我添加注释\n帮我测试';
+		cqInput.style.cssText = 'width:100%;height:80px;padding:6px 8px;border-radius:6px;border:1px solid rgba(255,255,255,.2);background:#2a2a3e;color:#e5e7eb;font-size:12px;resize:vertical;box-sizing:border-box;';
+		cqBox.appendChild(cqInput);
+		const cqBtnRow = document.createElement('div');
+		cqBtnRow.style.cssText = 'margin-top:4px;display:flex;gap:6px;';
+		const cqAddBtn = document.createElement('button');
+		cqAddBtn.textContent = '加入队列';
+		cqAddBtn.style.cssText = 'flex:1;padding:4px 8px;border-radius:6px;border:1px solid rgba(255,255,255,.2);background:#2a2a3e;color:#0ea5e9;font-size:12px;cursor:pointer;';
+		cqAddBtn.addEventListener('click', () => {
+			const text = cqInput.value.trim();
+			if (!text) return;
+			const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+			for (const line of lines) _chatQueue.push(line);
+			cqInput.value = '';
+			updateQueueUI();
+			console.log(LOG_PREFIX + '[ChatQueue] 添加' + lines.length + '条到队列, 当前队列长度=' + _chatQueue.length);
+			// 如果当前没有在等待回复，立即发送第一条
+			if (!_chatQueueProcessing && _chatQueue.length > 0) processQueue();
+		});
+		cqBtnRow.appendChild(cqAddBtn);
+		const cqClearBtn = document.createElement('button');
+		cqClearBtn.textContent = '清空';
+		cqClearBtn.style.cssText = 'padding:4px 8px;border-radius:6px;border:1px solid rgba(255,255,255,.2);background:#2a2a3e;color:#f56c6c;font-size:12px;cursor:pointer;';
+		cqClearBtn.addEventListener('click', () => {
+			_chatQueue.length = 0;
+			_chatQueueProcessing = false;
+			updateQueueUI();
+			console.log(LOG_PREFIX + '[ChatQueue] 队列已清空');
+		});
+		cqBtnRow.appendChild(cqClearBtn);
+		cqBox.appendChild(cqBtnRow);
+		// 队列状态显示
+		const cqStatus = document.createElement('div');
+		cqStatus.id = 'ws-cq-status';
+		cqStatus.style.cssText = 'margin-top:6px;font-size:11px;color:#9ca3af;max-height:60px;overflow-y:auto;';
+		cqBox.appendChild(cqStatus);
+		acSection.appendChild(cqBox);
+
+		function updateQueueUI() {
+			cqBox.style.display = settings.chatQueueEnabled ? 'block' : 'none';
+			const statusEl = document.getElementById('ws-cq-status');
+			if (statusEl) {
+				if (_chatQueue.length === 0) {
+					statusEl.textContent = '队列为空';
+				} else {
+					statusEl.innerHTML = '队列(' + _chatQueue.length + '条): ' + _chatQueue.map((q, i) => '<span style="color:' + (i === 0 && _chatQueueProcessing ? '#0ea5e9' : '#9ca3af') + '">' + (i + 1) + '.' + q.substring(0, 20) + (q.length > 20 ? '...' : '') + '</span>').join(' → ');
+				}
+			}
+		}
+
 		panel.appendChild(acSection);
 		
 		// 完成提示音区块
@@ -1730,7 +1805,40 @@
 		nsSection.appendChild(sysNotifyRow);
 
 		panel.appendChild(nsSection);
-		
+
+		// 刷新插件按钮
+		const reloadSection = document.createElement('div');
+		reloadSection.className = 'ws-better-section';
+		const reloadBtn = document.createElement('button');
+		reloadBtn.textContent = '🔄 刷新插件';
+		reloadBtn.style.cssText = 'width:100%;padding:8px 0;border-radius:8px;border:1px solid rgba(59,130,246,.4);background:rgba(59,130,246,.15);color:#60a5fa;font-size:13px;font-weight:600;cursor:pointer;transition:all .2s;';
+		reloadBtn.addEventListener('mouseenter', () => { reloadBtn.style.background = 'rgba(59,130,246,.3)'; });
+		reloadBtn.addEventListener('mouseleave', () => { reloadBtn.style.background = 'rgba(59,130,246,.15)'; });
+		reloadBtn.addEventListener('click', () => {
+			reloadBtn.textContent = '⏳ 刷新中...';
+			reloadBtn.style.pointerEvents = 'none';
+			console.log(LOG_PREFIX + '[Reload] 用户点击刷新插件，3秒后重载窗口...');
+			setTimeout(() => {
+				try {
+					// 优先用VSCode命令重载窗口（最稳定）
+					if (typeof vscode !== 'undefined' && vscode.postMessage) {
+						vscode.postMessage({ command: 'workbench.action.reloadWindow' });
+					} else {
+						// 兜底：直接重载页面
+						location.reload();
+					}
+				} catch {
+					location.reload();
+				}
+			}, 3000);
+		});
+		const reloadHint = document.createElement('div');
+		reloadHint.style.cssText = 'font-size:11px;color:#6b7280;margin-top:4px;text-align:center;';
+		reloadHint.textContent = '修改插件后点击此按钮使更新生效';
+		reloadSection.appendChild(reloadBtn);
+		reloadSection.appendChild(reloadHint);
+		panel.appendChild(reloadSection);
+
 		// 面板跟随齿轮位置
 		const positionPanel = () => {
 			const r = toggle.getBoundingClientRect();
@@ -1766,6 +1874,164 @@
 		document.body.appendChild(panel);
 	}
 	
+	// ========== 多轮对话队列 ==========
+	let _chatQueue = [];
+	let _chatQueueProcessing = false;
+	let _chatQueueObserver = null;
+	let _lastQueueStepCount = 0;
+
+	function sendQueueMessage(text) {
+		const ok = setInputText(text);
+		if (!ok) {
+			console.log(LOG_PREFIX + '[ChatQueue] 找不到输入框，无法发送');
+			return false;
+		}
+		setTimeout(() => {
+			for (const btn of document.querySelectorAll('button[type="submit"]')) {
+				const rect = btn.getBoundingClientRect();
+				if (rect.width === 0 || rect.height === 0) continue;
+				const arrowSvg = btn.querySelector('svg.lucide-arrow-up');
+				if (!arrowSvg) continue;
+				if (btn.classList.contains('cursor-not-allowed') || btn.classList.contains('opacity-50')) continue;
+				btn.click();
+				console.log(LOG_PREFIX + '[ChatQueue] ✅已发送: "' + text.substring(0, 30) + '..."');
+				return;
+			}
+			// 备用：用回车发送
+			const inputEl = findInputEl();
+			if (inputEl) {
+				inputEl.focus();
+				inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+				console.log(LOG_PREFIX + '[ChatQueue] ✅已通过回车发送: "' + text.substring(0, 30) + '..."');
+			}
+		}, 500);
+		return true;
+	}
+
+	function processQueue() {
+		if (!settings.chatQueueEnabled) return;
+		if (_chatQueue.length === 0) {
+			_chatQueueProcessing = false;
+			console.log(LOG_PREFIX + '[ChatQueue] 队列已空，停止处理');
+			return;
+		}
+		_chatQueueProcessing = true;
+		const text = _chatQueue.shift();
+		console.log(LOG_PREFIX + '[ChatQueue] 📤发送第1条(剩余' + _chatQueue.length + '条): "' + text.substring(0, 30) + '..."');
+		// 记录当前step数量，用于判断AI回复完成
+		_lastQueueStepCount = document.querySelectorAll('[data-step-index]').length;
+		const ok = sendQueueMessage(text);
+		if (!ok) {
+			_chatQueue.unshift(text);
+			_chatQueueProcessing = false;
+			console.log(LOG_PREFIX + '[ChatQueue] 发送失败，放回队列');
+		}
+		// 更新UI
+		const statusEl = document.getElementById('ws-cq-status');
+		if (statusEl) {
+			if (_chatQueue.length === 0) {
+				statusEl.textContent = '等待回复中...';
+			} else {
+				statusEl.innerHTML = '等待回复中... | 剩余' + _chatQueue.length + '条: ' + _chatQueue.map((q, i) => '<span style="color:#9ca3af">' + (i + 1) + '.' + q.substring(0, 15) + (q.length > 15 ? '...' : '') + '</span>').join(' → ');
+			}
+		}
+	}
+
+	function startChatQueueObserver() {
+		if (_chatQueueObserver) { _chatQueueObserver.disconnect(); _chatQueueObserver = null; }
+		let _lastQueueCheckTime = 0;
+		_chatQueueObserver = new MutationObserver(() => {
+			if (!_chatQueueProcessing || _chatQueue.length === 0) return;
+			// 节流3秒
+			const now = Date.now();
+			if (now - _lastQueueCheckTime < 3000) return;
+			_lastQueueCheckTime = now;
+			// 检测AI是否回复完成：step数量增加了
+			const allSteps = document.querySelectorAll('[data-step-index]');
+			const currentSteps = allSteps.length;
+			if (currentSteps <= _lastQueueStepCount) return;
+			// 找最大step-index
+			let lastStep = null, maxIdx = -1;
+			for (const s of allSteps) {
+				const idx = parseInt(s.getAttribute('data-step-index') || '0');
+				if (idx > maxIdx) { maxIdx = idx; lastStep = s; }
+			}
+			if (!lastStep) return;
+			// 检查是否是配额耗尽中断
+			const EXHAUST_KEYWORD = 'your included usage quota is exhausted';
+			const lastText = (lastStep.textContent || '').toLowerCase().replace(/\s+/g, ' ').trim();
+			if (lastText.includes(EXHAUST_KEYWORD)) {
+				// 检查AI是否还在生成中（button[type="submit"]里有svg.lucide-square=生成中）
+				let isGenerating = false;
+				for (const btn of document.querySelectorAll('button[type="submit"]')) {
+					if (btn.querySelector('svg.lucide-square')) { isGenerating = true; break; }
+				}
+				if (isGenerating) {
+					console.log(LOG_PREFIX + '[ChatQueue] ⚠️配额耗尽但AI仍在生成中，等待...');
+					_lastQueueStepCount = currentSteps;
+					return;
+				}
+				// AI已停止，检查队列首条是否是"继续"
+				if (_chatQueue.length > 0 && _chatQueue[0].trim() === '继续') {
+					// 删除队列中的"继续"，让自动继续机制通过输入框发送（更稳定：有重试/冷却/防重复）
+					_chatQueue.shift();
+					console.log(LOG_PREFIX + '[ChatQueue] 🗑️队列首条是"继续"，已删除，交给自动继续机制发送');
+					// 更新UI
+					const statusEl = document.getElementById('ws-cq-status');
+					if (statusEl) {
+						if (_chatQueue.length === 0) statusEl.textContent = '等待自动继续中...';
+						else statusEl.innerHTML = '等待自动继续中... | 剩余' + _chatQueue.length + '条';
+					}
+				} else {
+					console.log(LOG_PREFIX + '[ChatQueue] ⚠️AI因配额耗尽中断，等待自动继续处理...');
+				}
+				_lastQueueStepCount = currentSteps;
+				// 等自动继续发送后，AI会继续回复，观察器会再次触发检测
+				// 设一个定时器，在自动继续发送后60秒如果还没恢复，检查是否需要继续处理队列
+				setTimeout(() => {
+					if (!_chatQueueProcessing || _chatQueue.length === 0) return;
+					// 检查最后消息是否还是配额耗尽（自动继续可能失败了）
+					const stepsNow2 = document.querySelectorAll('[data-step-index]');
+					let lastStep2 = null, maxIdx2 = -1;
+					for (const s of stepsNow2) {
+						const idx = parseInt(s.getAttribute('data-step-index') || '0');
+						if (idx > maxIdx2) { maxIdx2 = idx; lastStep2 = s; }
+					}
+					if (lastStep2) {
+						const txt2 = (lastStep2.textContent || '').toLowerCase().replace(/\s+/g, ' ').trim();
+						if (txt2.includes(EXHAUST_KEYWORD)) {
+							console.log(LOG_PREFIX + '[ChatQueue] ⚠️60秒后仍配额耗尽，自动继续可能失败，尝试手动发送继续');
+							// 自动继续失败，队列自己发"继续"
+							_chatQueue.unshift('继续');
+							processQueue();
+						} else {
+							// 自动继续成功了，AI已回复，继续处理队列
+							console.log(LOG_PREFIX + '[ChatQueue] ✅自动继续成功，继续处理队列');
+							_lastQueueStepCount = stepsNow2.length;
+							setTimeout(() => processQueue(), 2000);
+						}
+					}
+				}, 60000);
+				return;
+			}
+			// 简单判断AI是否完成：step-index增加了且不含exhausted
+			// 延迟5秒再确认（等AI生成完毕）
+			setTimeout(() => {
+				const stepsNow = document.querySelectorAll('[data-step-index]').length;
+				if (stepsNow > currentSteps) {
+					// 又有新消息了，说明还没完成
+					_lastQueueStepCount = stepsNow;
+					return;
+				}
+				console.log(LOG_PREFIX + '[ChatQueue] ✅AI回复完成(step=' + currentSteps + ')，准备发送下一条');
+				_lastQueueStepCount = currentSteps;
+				setTimeout(() => processQueue(), 1500);
+			}, 5000);
+		});
+		_chatQueueObserver.observe(document.body, { childList: true, subtree: true });
+		console.log(LOG_PREFIX + '[ChatQueue] 观察器已启动');
+	}
+
 	// ========== 自动继续 ==========
 	let autoContinueObserver = null;
 	let _quotaContinueCooldown = false;
@@ -1819,79 +2085,36 @@
 				} catch {}
 			}
 
-			// 关键：只在当前对话的聊天消息区域内检测配额耗尽的红色警告
-			// 严格匹配：必须含 lucide-triangle-alert 图标 + 精确文本 "quota is exhausted"
-			// 排除：代码diff区域（红色背景删除行）、换号提示、侧边栏
-			const chatRoot = findChatRoot() || document.querySelector('#chat') || document;
-			let quotaAlertEl = null;
-
-			// 只在AI消息块内搜索（排除代码diff区域）
-			// AI消息块特征：text-ide-message-block-bot-color 或 message-block
-			const aiMsgBlocks = chatRoot.querySelectorAll(
-				'[class*="message-block-bot"], [class*="message-block"], [data-message-author-role="assistant"]'
-			);
-			// 诊断：页面中所有triangle-alert图标和含exhausted文本的元素
-			const allTriangleAlerts = document.querySelectorAll('svg.lucide-triangle-alert');
-			const allExhausted = document.querySelectorAll('div, span');
-			let exhaustedCount = 0;
-			for (const el of allExhausted) { if ((el.textContent || '').toLowerCase().includes('exhausted')) exhaustedCount++; }
-			console.log(LOG_PREFIX + '[AutoContinue] 🔍开始检测: chatRoot=' + !!chatRoot + '(class=' + (chatRoot?.className?.substring(0, 50) || 'none') + '), aiMsgBlocks=' + aiMsgBlocks.length + ', 页面triangle-alert=' + allTriangleAlerts.length + ', 含exhausted元素=' + exhaustedCount);
-			for (let i = aiMsgBlocks.length - 1; i >= 0; i--) {
-				const block = aiMsgBlocks[i];
-				// 在AI消息块内查找 triangle-alert 图标
-				const alertIcon = block.querySelector('svg.lucide-triangle-alert');
-				if (!alertIcon) { console.log(LOG_PREFIX + '[AutoContinue] ↩️AI块#' + i + ': 无triangle-alert图标，跳过'); continue; }
-				// 查找包含 alert 图标的最近红色div
-				const alertDiv = alertIcon.closest('div[class*="bg-red"]') || alertIcon.closest('div[class*="rounded"]');
-				if (!alertDiv) { console.log(LOG_PREFIX + '[AutoContinue] ↩️AI块#' + i + ': 有triangle-alert但无bg-red/rounded父div，跳过'); continue; }
-				const txt = (alertDiv.textContent || '').toLowerCase();
-				// 必须包含精确的配额耗尽文本
-				if (txt.includes('quota is exhausted') || (txt.includes('usage quota') && txt.includes('exhausted'))) {
-					console.log(LOG_PREFIX + '[AutoContinue] 🎯方式1匹配: AI消息块#' + i + ', alertDiv文本="' + txt.substring(0, 80) + '..."');
-					quotaAlertEl = alertDiv;
-					break;
-				} else {
-					console.log(LOG_PREFIX + '[AutoContinue] ↩️AI块#' + i + ': 有alert图标+红色div，但文本不含"quota is exhausted"(="' + txt.substring(0, 60) + '")，跳过');
-				}
-			}
-
-			// 方式2：在AI消息块内查找含精确文本+购买链接的元素（也要求triangle-alert）
-			if (!quotaAlertEl) {
-				console.log(LOG_PREFIX + '[AutoContinue] 🔍方式1未匹配，尝试方式2...');
-				for (let i = aiMsgBlocks.length - 1; i >= 0; i--) {
-					const block = aiMsgBlocks[i];
-					if (!block.querySelector('svg.lucide-triangle-alert')) continue;
-					const txt = (block.textContent || '').toLowerCase();
-					if (txt.includes('quota is exhausted') && (txt.includes('购买') || txt.includes('add-credits') || txt.includes('redirect') || txt.includes('purchase'))) {
-						console.log(LOG_PREFIX + '[AutoContinue] 🎯方式2匹配: AI消息块#' + i + ', 文本="' + txt.substring(0, 80) + '..."');
-						quotaAlertEl = block;
-						break;
-					}
-				}
-			}
-			if (!quotaAlertEl) {
-				console.log(LOG_PREFIX + '[AutoContinue] ❌未找到配额耗尽警告(aiMsgBlocks=' + aiMsgBlocks.length + ')，正常完成不触发');
+			// 配额耗尽检测：找最后一条消息(data-step-index最大)，检查文本
+			const EXHAUST_KEYWORD = 'your included usage quota is exhausted';
+			const allSteps = document.querySelectorAll('[data-step-index]');
+			console.log(LOG_PREFIX + '[AutoContinue] 🔍检测: step-index元素=' + allSteps.length);
+			if (allSteps.length === 0) {
+				console.log(LOG_PREFIX + '[AutoContinue] ❌页面无data-step-index元素，跳过');
 				return;
 			}
-			console.log(LOG_PREFIX + '[AutoContinue] ✅找到配额耗尽警告，验证是否为最后一条消息...');
-			// 验证：这个alert必须是当前对话最后出现的（后面没有新的AI消息）
-			const alertRect = quotaAlertEl.getBoundingClientRect();
-			const allMsgs = chatRoot.querySelectorAll('[class*="message-block"], [class*="message-content"], [data-message-author-role]');
-			for (let i = allMsgs.length - 1; i >= 0; i--) {
-				const r = allMsgs[i].getBoundingClientRect();
-				if (r.width > 0 && r.height > 0) {
-					// 如果最后一条消息在alert下方，说明alert不是最后的，不触发
-					if (r.top > alertRect.bottom + 5) {
-						console.log(LOG_PREFIX + '[AutoContinue] ❌配额警告不是最后一条消息(alert.bottom=' + alertRect.bottom + ', lastMsg.top=' + r.top + ')，跳过');
-						return;
-					}
-					console.log(LOG_PREFIX + '[AutoContinue] ✅配额警告是最后一条消息，继续检查...');
-					break;
-				}
+			// 找最大step-index（=最后一条消息）
+			let lastStep = null;
+			let maxIndex = -1;
+			for (const s of allSteps) {
+				const idx = parseInt(s.getAttribute('data-step-index') || '0');
+				if (idx > maxIndex) { maxIndex = idx; lastStep = s; }
 			}
+			if (!lastStep) {
+				console.log(LOG_PREFIX + '[AutoContinue] ❌未找到有效的step-index元素，跳过');
+				return;
+			}
+			// 检查最后一条消息的文本是否包含配额耗尽关键词
+			const lastText = (lastStep.textContent || '').toLowerCase().replace(/\s+/g, ' ').trim();
+			console.log(LOG_PREFIX + '[AutoContinue] 📋最后消息(step=' + maxIndex + '): 文本前80字="' + lastText.substring(0, 80) + '..."');
+			if (!lastText.includes(EXHAUST_KEYWORD)) {
+				console.log(LOG_PREFIX + '[AutoContinue] ❌最后消息不含"' + EXHAUST_KEYWORD + '"，正常完成不触发');
+				return;
+			}
+			console.log(LOG_PREFIX + '[AutoContinue] ✅最后消息(step=' + maxIndex + ')含配额耗尽关键词，继续检查...');
 
 			// 防重复：记录已处理的alert签名（简单hash）
-			const alertText = (quotaAlertEl.textContent || '').substring(0, 100);
+			const alertText = (lastStep.textContent || '').substring(0, 100);
 			let alertHash = 0;
 			for (let i = 0; i < alertText.length; i++) alertHash = ((alertHash << 5) - alertHash + alertText.charCodeAt(i)) | 0;
 			const handledKey = 'ws-quota-handled-' + alertHash;
@@ -1900,26 +2123,14 @@
 				return;
 			}
 
-			// 检查配额详情：日和周额度都不是100%才能继续
-			const quotaSection = document.querySelector('.breakdown-details') || document.querySelector('[class*="breakdown"]');
-			if (quotaSection) {
-				const rows = quotaSection.querySelectorAll('.quota-row, [class*="quota-row"]');
-				let dailyFull = false, weeklyFull = false;
-				for (const row of rows) {
-					const label = (row.querySelector('.quota-label, [class*="quota-label"]')?.textContent || '').toLowerCase();
-					const value = (row.querySelector('.quota-value, [class*="quota-value"]')?.textContent || '').trim();
-					if (label.includes('每日') || label.includes('daily')) {
-						dailyFull = value === '100%';
-					}
-					if (label.includes('每周') || label.includes('weekly')) {
-						weeklyFull = value === '100%';
-					}
-				}
-				if (dailyFull && weeklyFull) {
-					console.log(LOG_PREFIX + '[AutoContinue] 配额已全部用完(日+周均100%)，无法继续');
-					return;
-				}
-				console.log(LOG_PREFIX + '[AutoContinue] 配额检测: 日=' + (dailyFull ? '100%' : '有余') + ', 周=' + (weeklyFull ? '100%' : '有余'));
+			// 二次验证：确认最后消息内确实有 lucide-triangle-alert 图标和 bg-red-600 样式
+			// 真实DOM结构: div[data-step-index] > div > div.bg-red-600 > svg.lucide-triangle-alert + span
+			const hasAlertIcon = lastStep.querySelector('svg.lucide-triangle-alert');
+			const hasRedBg = lastStep.querySelector('[class*="bg-red-600"], [class*="bg-red-500"]');
+			console.log(LOG_PREFIX + '[AutoContinue] 🔍二次验证: alertIcon=' + !!hasAlertIcon + ', redBg=' + !!hasRedBg);
+			if (!hasAlertIcon && !hasRedBg) {
+				// 兜底：文本匹配已通过，可能UI结构变化，仍然继续但记录警告
+				console.log(LOG_PREFIX + '[AutoContinue] ⚠️无triangle-alert/red-600图标，但文本匹配通过，继续发送');
 			}
 
 			// 执行发送"继续"的逻辑（含重试）
@@ -1936,25 +2147,14 @@
 					}
 
 					// 检查是否已有排队的"继续"消息（避免重复发送）
-					const queuedMsgs = document.querySelectorAll('[class*="message queued"], [class*="truncate"]');
-					for (const el of queuedMsgs) {
-						const txt = (el.textContent || '').trim();
-						if (txt === '继续') {
-							// 检查附近是否有 "message queued" 文本
-							const parent = el.closest('[class*="flex-col"]') || el.parentElement?.parentElement;
-							if (parent && parent.textContent.includes('queued')) {
-								console.log(LOG_PREFIX + '[AutoContinue] 已有排队的"继续"消息，跳过');
-								_quotaContinueCooldown = false;
-								return;
-							}
-						}
-					}
-					// 更精确的检测：查找 "message queued" 文本附近的 "继续"
+					// 真实DOM: span文本含 "message queued" / "messages queued" / "条消息排队中"
 					const chatRoot2 = findChatRoot() || document;
-					const queuedSpans = chatRoot2.querySelectorAll('span');
-					for (const span of queuedSpans) {
-						if ((span.textContent || '').includes('message queued') || (span.textContent || '').includes('queued')) {
-							const container = span.closest('[class*="flex-col"]') || span.parentElement;
+					const allSpans = chatRoot2.querySelectorAll('span');
+					for (const span of allSpans) {
+						const spanText = (span.textContent || '').toLowerCase();
+						if (spanText.includes('message queued') || spanText.includes('messages queued') || spanText.includes('条消息排队中')) {
+							// 找到排队提示文本，检查同一区域是否含"继续"
+							const container = span.closest('div[class*="flex"]') || span.parentElement;
 							if (container && container.textContent.includes('继续')) {
 								console.log(LOG_PREFIX + '[AutoContinue] 已有排队的"继续"消息，跳过');
 								_quotaContinueCooldown = false;
@@ -2010,6 +2210,8 @@
 									console.log(LOG_PREFIX + '[AutoContinue] 已恢复用户输入');
 								}, 800);
 							}
+							// 通知队列观察器：自动继续已发送，更新step计数
+							_lastQueueStepCount = document.querySelectorAll('[data-step-index]').length;
 							break;
 						}
 						if (!sent) {
@@ -2208,6 +2410,7 @@
 		dismissCorruptWarning();
 		if (settings.autoContinueEnabled) startAutoContinue();
 		if (settings.notificationSoundEnabled) startNotificationSound();
+		if (settings.chatQueueEnabled) startChatQueueObserver();
 		
 		// 启动气泡功能
 		if (settings.bubblesEnabled) {
