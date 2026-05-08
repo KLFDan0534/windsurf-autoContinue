@@ -58,6 +58,8 @@ def find_windsurf_workbench(custom_path: str = None) -> Path | None:
 
     # 硬编码路径搜索
     for root_path in SEARCH_ROOTS:
+        if not root_path.exists():
+            continue
         wb = root_path / WORKBENCH_SUBPATH
         if wb.exists() and (wb / TARGET_FILENAME).exists():
             print(f"从预设路径找到: {root_path}")
@@ -179,7 +181,7 @@ def deploy(target_dir: Path, dry_run: bool = False, analyzer: bool = False, loca
         if localization and better:
             return False, "参数冲突：-l 和 -b 不能同时使用"
 
-        source_file = DOM_ANALYZER_SOURCE if analyzer else (LOCALIZATION_SOURCE if localization else (BETTER_SOURCE if better else JS_SOURCE))
+        source_file = DOM_ANALYZER_SOURCE if analyzer else (LOCALIZATION_SOURCE if localization else BETTER_SOURCE if better else BETTER_SOURCE)
         if not source_file.exists():
             return False, f"源文件不存在: {source_file}"
 
@@ -262,6 +264,29 @@ def status(target_dir: Path):
         print(f"  补丁状态: {' 已打补丁' if is_patched(html) else ' 未打补丁'}")
 
 
+def find_windsurf_root(custom_path: str = None) -> Path | None:
+    """查找 Windsurf 安装根目录（非workbench子目录）"""
+    if custom_path:
+        p = Path(custom_path)
+        # 如果传入的是workbench目录，向上推4级到根目录
+        if (p / TARGET_FILENAME).exists():
+            # p 是 workbench 目录，推到根: workbench -> electron-browser -> code -> vs -> out -> app -> resources -> root
+            return p.parent.parent.parent.parent.parent.parent
+        return p
+
+    # 从快捷方式解析
+    root = _find_from_shortcuts()
+    if root:
+        return root
+
+    # 硬编码路径搜索
+    for root_path in SEARCH_ROOTS:
+        if root_path.exists():
+            return root_path
+
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Windsurf Better 部署工具",
@@ -298,15 +323,52 @@ def main():
 
     print(f" 目标目录: {target_dir}")
 
-    if args.action == "deploy":
-        success, msg = deploy(target_dir, args.dry_run, args.analyzer, args.localization, args.better)
-    elif args.action == "restore":
-        success, msg = restore(target_dir, args.dry_run)
-    elif args.action == "status":
-        status(target_dir)
-        return
+    # 收集所有需要部署的目录（常规 + _ 子目录）
+    target_dirs = [target_dir]
+    windsurf_root = find_windsurf_root(args.target)
+    if windsurf_root:
+        underscore_dir = windsurf_root / "_" / WORKBENCH_SUBPATH
+        if underscore_dir.exists() and (underscore_dir / TARGET_FILENAME).exists() and underscore_dir != target_dir:
+            target_dirs.append(underscore_dir)
+            print(f" 同时部署到_子目录: {underscore_dir}")
 
-    print(f"\n{'成功' if success else '失败'}: {msg}")
+    if args.action == "deploy":
+        all_success = True
+        for td in target_dirs:
+            print(f"\n--- 部署到: {td} ---")
+            success, msg = deploy(td, args.dry_run, args.analyzer, args.localization, args.better)
+            print(f"{'成功' if success else '失败'}: {msg}")
+            if not success:
+                all_success = False
+
+        # 部署Extension到Windsurf扩展目录
+        if args.better:
+            print("\n--- 部署Extension ---")
+            ext_source = SCRIPT_DIR / "windsurf-better-extension"
+            ext_target = Path(os.environ.get("USERPROFILE", "")) / ".windsurf" / "extensions" / "windsurf-better.windsurf-better-1.4.4"
+            if ext_source.exists():
+                try:
+                    if ext_target.exists():
+                        shutil.rmtree(ext_target)
+                    shutil.copytree(ext_source, ext_target)
+                    print(f" 已部署Extension到: {ext_target}")
+                except Exception as e:
+                    print(f" Extension部署失败: {e}")
+                    all_success = False
+            else:
+                print(f" Extension源目录不存在: {ext_source}")
+    elif args.action == "restore":
+        all_success = True
+        for td in target_dirs:
+            print(f"\n--- 恢复: {td} ---")
+            success, msg = restore(td, args.dry_run)
+            print(f"{'成功' if success else '失败'}: {msg}")
+            if not success:
+                all_success = False
+    elif args.action == "status":
+        for td in target_dirs:
+            status(td)
+        return
 
 
 if __name__ == "__main__":
