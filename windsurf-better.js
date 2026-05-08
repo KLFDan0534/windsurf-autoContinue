@@ -1,11 +1,34 @@
 /**
- * Windsurf Better v1.0.0
- * 整合版：气泡提示 + 汉化
+ * Windsurf Better v1.4.4
+ * 整合版：气泡提示 + 汉化 + 自动继续
+ * v1.4.4: 修复AI提问不提示、长时间运行不自动继续、配额余额检查
  */
 (function () {
 	'use strict';
-	const VERSION = '1.0.0';
+	const VERSION = '1.4.4';
 	const LOG_PREFIX = '[WS-Better]';
+
+	// ========== Trusted Types 支持 ==========
+	// Windsurf要求TrustedHTML，必须通过policy创建
+	let _ttPolicy = null;
+	function getTTPolicy() {
+		if (_ttPolicy) return _ttPolicy;
+		try {
+			if (window.trustedTypes && window.trustedTypes.createPolicy) {
+				_ttPolicy = window.trustedTypes.createPolicy('abBubbles', {
+					createHTML: (input) => input,
+					createScript: (input) => input,
+					createScriptURL: (input) => input,
+				});
+			}
+		} catch (e) { console.log(LOG_PREFIX + 'TrustedTypes policy创建失败:', e.message); }
+		return _ttPolicy;
+	}
+	function setTrustedHTML(el, html) {
+		const policy = getTTPolicy();
+		if (policy) { el.innerHTML = policy.createHTML(html); }
+		else { el.innerHTML = html; }
+	}
 	
 	// ========== 统一配置 ==========
 	const DEFAULT_SETTINGS = {
@@ -20,12 +43,21 @@
 		autoContinueEnabled: true,
 		// 多轮对话队列
 		chatQueueEnabled: true,
-		// 完成提示音
-		notificationSoundEnabled: true,
-		notificationSoundPreset: 'chime',
-		notificationSoundVolume: 0.3,
-		notificationSystemEnabled: true,
+		// 通知与提示音
+		notifySoundEnabled: true,
+		notifySoundVolume: 0.3,
+		notifySoundPreset: 'chime',
+		notifySystemEnabled: true,
+		// 各事件通知开关
+		notifyOnComplete: true,      // AI回复完成
+		notifyOnAutoContinue: true,  // 自动发送了"继续"
+		notifyOnQuotaExhaust: false, // 配额耗尽（默认关闭）
+		notifyOnQueueDone: true,     // 队列全部完成
+		notifyOnAiQuestion: true,    // AI提问需要用户输入
 		togglePos: null,
+		// 外观
+		panelBgColor: '#1e1e2e',
+		toggleBgColor: 'rgba(128,128,128,.15)',
 	};
 	const STORAGE_KEY = 'ws-better-settings';
 	
@@ -45,6 +77,49 @@
 	}
 	
 	let settings = loadSettings();
+
+	// 监听localStorage变化，实时更新设置（webview侧边栏修改后触发）
+	window.addEventListener('storage', (e) => {
+		if (e.key === STORAGE_KEY) {
+			settings = loadSettings();
+			console.log(LOG_PREFIX + '[Settings] 设置已更新:', JSON.stringify(settings));
+		}
+	});
+	// 全局函数：供Extension注入调用
+	window.__wsBetterReloadSettings = () => {
+		settings = loadSettings();
+		console.log(LOG_PREFIX + '[Settings] Extension触发设置更新');
+	};
+	// 轮询Extension写入的临时文件（webview localStorage与workbench隔离，需通过文件中转）
+	// Extension webview修改设置后，Extension host写入 %TEMP%/ws-better-settings-update.json
+	const _settingsUpdatePath = (() => {
+		try {
+			// Electron环境中可以用process.env.TEMP
+			if (typeof process !== 'undefined' && process.env && process.env.TEMP) {
+				return require('path').join(process.env.TEMP, 'ws-better-settings-update.json');
+			}
+		} catch {}
+		return null;
+	})();
+	if (_settingsUpdatePath) {
+		let _lastSettingsUpdateTs = 0;
+		setInterval(() => {
+			try {
+				const fs = require('fs');
+				const content = fs.readFileSync(_settingsUpdatePath, 'utf-8');
+				const update = JSON.parse(content);
+				if (update.ts > _lastSettingsUpdateTs) {
+					_lastSettingsUpdateTs = update.ts;
+					// 应用设置变更到localStorage
+					const s = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+					s[update.key] = update.value;
+					localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
+					settings = loadSettings();
+					console.log(LOG_PREFIX + '[Settings] 从Extension文件更新设置: ' + update.key + '=' + JSON.stringify(update.value));
+				}
+			} catch {}
+		}, 2000);
+	}
 	
 	// ========== 气泡功能 ==========
 	const CHAT_ROOT_SELECTOR = '.chat-client-root';
@@ -108,7 +183,124 @@
 	}
 	
 	function logBubbles(...args) { console.log(LOG_PREFIX + '[Bubbles]', ...args); }
-	
+
+	// ========== 统一配额耗尽检测 ==========
+	// Windsurf v1.6+ 配额耗尽显示为顶部banner浮层（不在[data-step-index]中）
+	// banner DOM: div.z-\[1000\].absolute.rounded.px-2.bg-red-600 / bg-yellow-600
+	//   → p "Your included daily usage quota is exhausted..."
+	const EXHAUST_KEYWORDS = [
+		'your included usage quota is exhausted',
+		'your included daily usage quota is exhausted',
+		'your included weekly usage quota is exhausted',
+		'quota is exhausted',
+		'usage quota is exhausted',
+		'配额已用完',
+		'每日配额已用完',
+	];
+	// 激进文本清理：去除所有不可见字符后toLowerCase+合并空白
+	function cleanText(raw) {
+		return raw
+			.replace(/[\u200B-\u200D\uFEFF\u00AD\u2060\u2061-\u2064\u206A-\u206F]/g, '') // 零宽字符
+			.replace(/[^\S\n]+/g, ' ')  // 非换行空白合并为一个空格
+			.replace(/\n+/g, ' ')       // 换行变空格
+			.toLowerCase()
+			.trim();
+	}
+	/**
+	 * 检测配额耗尽：同时搜索banner浮层和step元素
+	 * @returns {{ detected: boolean, source: 'banner'|'step'|'none', element: Element|null, text: string }}
+	 */
+	function detectQuotaExhausted() {
+		// 重要：必须用document搜索，不能用chatRoot！
+		// 因为[data-step-index]和banner可能在chat-client-root之外
+		// 1. 检测banner浮层（Windsurf新版本的主要方式）
+		const bannerSelectors = [
+			'div[class*="z-"][class*="absolute"][class*="rounded"]',
+			'div[class*="z-"][class*="absolute"][class*="bg-red"]',
+			'div[class*="z-"][class*="absolute"][class*="bg-yellow"]',
+			'div.absolute.rounded[class*="px-2"]',
+		];
+		const checked = new Set();
+		// 搜索范围：document + 所有iframe的contentDocument + shadow DOM
+		const searchRoots = [document];
+		try {
+			for (const f of document.querySelectorAll('iframe')) {
+				try { if (f.contentDocument) searchRoots.push(f.contentDocument); } catch {}
+			}
+		} catch {}
+		// 穿透shadow DOM的查询函数
+		function queryAll(root, selector) {
+			const results = Array.from(root.querySelectorAll(selector));
+			try {
+				for (const el of root.querySelectorAll('*')) {
+					if (el.shadowRoot) {
+						results.push(...queryAll(el.shadowRoot, selector));
+					}
+				}
+			} catch {}
+			return results;
+		}
+		for (const root of searchRoots) {
+			for (const sel of bannerSelectors) {
+				for (const banner of queryAll(root, sel)) {
+					if (checked.has(banner)) continue;
+					checked.add(banner);
+					const txt = cleanText(banner.textContent || '');
+					if (EXHAUST_KEYWORDS.some(kw => txt.includes(kw))) {
+						console.log(LOG_PREFIX + '[QuotaDetect] 🎯检测到配额耗尽banner: "' + txt.substring(0, 80) + '..."');
+						return { detected: true, source: 'banner', element: banner, text: txt };
+					}
+				}
+			}
+			// 1.5 全局兜底：搜索所有可见的绝对定位元素中的配额文本
+			for (const el of queryAll(root, 'div.absolute, div[class*="z-10"], div[class*="z-20"], div[class*="z-30"], div[class*="z-40"], div[class*="z-50"]')) {
+				if (checked.has(el)) continue;
+				try {
+					const rect = el.getBoundingClientRect();
+					if (rect.width === 0 || rect.height === 0) continue;
+				} catch { continue; }
+				const txt = cleanText(el.textContent || '');
+				if (EXHAUST_KEYWORDS.some(kw => txt.includes(kw))) {
+					console.log(LOG_PREFIX + '[QuotaDetect] 🎯兜底检测到配额耗尽元素: "' + txt.substring(0, 80) + '..."');
+					return { detected: true, source: 'banner', element: el, text: txt };
+				}
+			}
+			// 1.6 搜索bg-red-600/yellow-600的step内联配额消息
+			for (const el of queryAll(root, '[data-step-index] div[class*="bg-red-6"], [data-step-index] div[class*="bg-yellow-6"]')) {
+				if (checked.has(el)) continue;
+				checked.add(el);
+				const txt = cleanText(el.textContent || '');
+				if (EXHAUST_KEYWORDS.some(kw => txt.includes(kw))) {
+					console.log(LOG_PREFIX + '[QuotaDetect] 🎯检测到step内联配额耗尽: "' + txt.substring(0, 80) + '..."');
+					return { detected: true, source: 'step', element: el, text: txt };
+				}
+			}
+			// 2. 检测所有step元素中的配额耗尽文本（检查最近N个step）
+			const allSteps = queryAll(root, '[data-step-index]');
+			if (allSteps.length > 0) {
+				const stepArr = allSteps.map(s => ({
+					el: s,
+					idx: parseInt(s.getAttribute('data-step-index') || '0')
+				})).sort((a, b) => b.idx - a.idx);
+				const checkCount = Math.min(5, stepArr.length);
+				for (let i = 0; i < checkCount; i++) {
+					const s = stepArr[i];
+					const txt = cleanText(s.el.textContent || '');
+					if (EXHAUST_KEYWORDS.some(kw => txt.includes(kw))) {
+						console.log(LOG_PREFIX + '[QuotaDetect] 🎯检测到step中配额耗尽(step=' + s.idx + '): "' + txt.substring(0, 80) + '..."');
+						return { detected: true, source: 'step', element: s.el, text: txt };
+					}
+				}
+				// 调试：输出最后一个step的清理后文本
+				if (stepArr.length > 0) {
+					const lastTxt = cleanText(stepArr[0].el.textContent || '');
+					console.log(LOG_PREFIX + '[QuotaDetect] 🔍最后step(' + stepArr[0].idx + ')清理后文本前120字="' + lastTxt.substring(0, 120) + '"');
+				}
+			}
+		}
+		return { detected: false, source: 'none', element: null, text: '' };
+	}
+
 	function findChatRoot() {
 		let root = document.querySelector(CHAT_ROOT_SELECTOR);
 		if (root) return root;
@@ -147,16 +339,118 @@
 		return null;
 	}
 	
+	// 模拟键盘事件的辅助函数
+	function simKey(el, type, key, code, keyCode, opts = {}) {
+		const e = new KeyboardEvent(type, {
+			key, code, keyCode, which: keyCode,
+			bubbles: true, cancelable: true, composed: true,
+			...opts
+		});
+		el.dispatchEvent(e);
+	}
+
 	function setInputText(text) {
 		const inputEl = findInputEl();
 		if (!inputEl) { logBubbles('找不到输入框'); return false; }
 		inputEl.focus();
+		if (document.activeElement !== inputEl) {
+			inputEl.click();
+			inputEl.focus();
+		}
+
 		if (inputEl.getAttribute('data-lexical-editor') === 'true') {
-			const sel = window.getSelection();
-			if (sel && inputEl.firstChild) { sel.selectAllChildren(inputEl); sel.deleteFromDocument(); }
-			document.execCommand('insertText', false, text);
+			console.log(LOG_PREFIX + '[setInputText] Lexical编辑器，开始输入"' + text + '"...');
+
+			// ===== 策略1（最可靠）: Lexical Editor API 直接设置文本 =====
+			try {
+				const editorKey = Object.keys(inputEl).find(k => k.startsWith('__lexicalEditor'));
+				if (editorKey) {
+					const editor = inputEl[editorKey];
+					if (editor && editor.update && editor.getEditorState) {
+						let apiOk = false;
+						editor.update(() => {
+							const state = editor.getEditorState();
+							state.read(() => {
+								const root = state._nodeMap.get('root');
+								if (!root) return;
+								// 遍历所有文本节点，替换为指定文本
+								const textNodes = [];
+								state._nodeMap.forEach((node, key) => {
+									if (node && node.__type === 'text') textNodes.push(node);
+								});
+								if (textNodes.length > 0) {
+									// 保留第一个文本节点，删除其余
+									textNodes[0].__text = text;
+									for (let i = 1; i < textNodes.length; i++) {
+										try { textNodes[i].remove(); } catch {}
+									}
+									apiOk = true;
+								} else if (root.__firstChild) {
+									// 有段落但无文本节点，在第一个段落中创建
+									const firstPara = state._nodeMap.get(root.__firstChild);
+									if (firstPara) {
+										const Lexical = window.Lexical;
+										if (Lexical && Lexical.$createTextNode) {
+											const newNode = Lexical.$createTextNode(text);
+											firstPara.clear();
+											firstPara.append(newNode);
+											apiOk = true;
+										}
+									}
+								}
+							});
+						});
+						if (apiOk) {
+							inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+							const textAfter = (inputEl.textContent || '').replace(/\u200B/g, '').trim();
+							if (textAfter === text) {
+								console.log(LOG_PREFIX + '[setInputText] ✅Lexical API写入成功');
+								logBubbles('已写入(Lexical-API)');
+								return true;
+							}
+							console.log(LOG_PREFIX + '[setInputText] Lexical API设置了但验证失败(after="' + textAfter.substring(0, 30) + '")');
+						}
+					}
+				}
+			} catch (e) {
+				console.log(LOG_PREFIX + '[setInputText] Lexical API异常:', e.message);
+			}
+
+			// ===== 策略2: 全选删除 + insertText =====
+			try {
+				// 用Selection API全选后删除（比键盘事件更可靠）
+				const sel = window.getSelection();
+				if (sel) {
+					sel.selectAllChildren(inputEl);
+					sel.deleteFromDocument();
+				}
+				// 等一帧让Lexical处理
+				const curAfter = (inputEl.textContent || '').replace(/\u200B/g, '').trim();
+				if (curAfter) {
+					// Selection删除失败，尝试execCommand
+					document.execCommand('selectAll');
+					document.execCommand('delete');
+				}
+				const insertOk = document.execCommand('insertText', false, text);
+				const textAfter = (inputEl.textContent || '').replace(/\u200B/g, '').trim();
+				if (textAfter === text) {
+					console.log(LOG_PREFIX + '[setInputText] ✅全选删除+insertText写入成功');
+					logBubbles('已写入(Lexical-全选删除+insertText)');
+					return true;
+				}
+				console.log(LOG_PREFIX + '[setInputText] insertText未生效(insertOk=' + insertOk + ', after="' + textAfter.substring(0, 30) + '")');
+			} catch (e) {
+				console.log(LOG_PREFIX + '[setInputText] insertText异常:', e.message);
+			}
+
+			// ===== 策略3: DOM兜底 =====
+			console.log(LOG_PREFIX + '[setInputText] ⚠️所有策略均未生效，使用DOM兜底');
+			inputEl.textContent = '';
+			const p = document.createElement('p');
+			p.textContent = text;
+			inputEl.appendChild(p);
 			inputEl.dispatchEvent(new Event('input', { bubbles: true }));
-			logBubbles('已写入(Lexical)');
+			logBubbles('已写入(Lexical-DOM兜底)');
 			return true;
 		}
 		if (inputEl.contentEditable === 'true') {
@@ -174,7 +468,10 @@
 			logBubbles('已写入(textarea)');
 			return true;
 		}
-		inputEl.innerHTML = '';
+		// 非Lexical非textarea的fallback：用DOM操作
+		inputEl.focus();
+		document.execCommand('selectAll');
+		document.execCommand('delete');
 		text.split('\n').forEach(line => {
 			const p = document.createElement('p');
 			p.textContent = line || '\u200B';
@@ -555,8 +852,11 @@
 	}
 	
 	let bubblesObserver = null;
+	let _bubblesScope = null;
+	let _bubblesTimer = 0;
+
 	function startBubblesObserving() {
-		if (bubblesObserver) { bubblesObserver.disconnect(); bubblesObserver = null; }
+		if (bubblesObserver) { bubblesObserver = null; }
 		if (!settings.bubblesEnabled) return;
 		const scope = findChatRoot();
 		if (!scope) {
@@ -565,12 +865,15 @@
 			return;
 		}
 		logBubbles('✅已找到聊天根，开始监听');
-		bubblesObserver = new MutationObserver(() => {
-			clearTimeout(window._wsBubTimer);
-			window._wsBubTimer = setTimeout(() => scanForBubbles(scope), 500);
-		});
-		bubblesObserver.observe(scope, { childList: true, subtree: true });
+		_bubblesScope = scope;
 		scanForBubbles(scope);
+		// 由统一观察器接管触发，此处仅记录scope
+	}
+
+	function onBubblesMutation() {
+		if (!_bubblesScope || !settings.bubblesEnabled) return;
+		clearTimeout(_bubblesTimer);
+		_bubblesTimer = setTimeout(() => scanForBubbles(_bubblesScope), 500);
 	}
 	
 	// ========== 汉化功能 ==========
@@ -1396,9 +1699,13 @@
 		if (!elementRoot) return;
 		
 		translateAttributes(elementRoot);
-		const elementList = elementRoot.querySelectorAll ? elementRoot.querySelectorAll('*') : [];
-		for (const el of elementList) {
-			translateAttributes(el);
+		// 仅遍历含可翻译属性的元素，而非全部元素
+		const attrSelector = ATTRS_TO_TRANSLATE.map(a => '[' + a + ']').join(',');
+		if (attrSelector) {
+			const attrElements = elementRoot.querySelectorAll(attrSelector);
+			for (const el of attrElements) {
+				translateAttributes(el);
+			}
 		}
 		
 		const walker = document.createTreeWalker(elementRoot, NodeFilter.SHOW_TEXT);
@@ -1411,474 +1718,87 @@
 	
 	let pendingRoots = new Set();
 	let rafId = 0;
-	let localizationObserver = null;
-	
+	let _isTranslating = false; // 防止翻译触发mutation→无限循环
+
 	function flushQueue() {
 		rafId = 0;
-		if (!settings.localizationEnabled) return;
+		if (!settings.localizationEnabled) { pendingRoots.clear(); return; }
+		_isTranslating = true;
 		for (const root of pendingRoots) {
 			scanAndTranslate(root);
 		}
 		pendingRoots.clear();
+		// 延迟重置标志，让mutation回调中的_isTranslating仍为true以跳过
+		setTimeout(() => { _isTranslating = false; }, 0);
 	}
-	
+
 	function enqueue(root) {
+		if (_isTranslating) return; // 翻译自身触发的mutation，跳过
 		pendingRoots.add(root || document.body);
 		if (!rafId) {
 			rafId = requestAnimationFrame(flushQueue);
 		}
 	}
-	
+
 	function startLocalizationObserver() {
-		if (localizationObserver) localizationObserver.disconnect();
-		localizationObserver = new MutationObserver((mutations) => {
-			for (const mutation of mutations) {
-				if (mutation.type === 'characterData') {
-					enqueue(mutation.target);
-					continue;
-				}
-				if (mutation.type === 'attributes') {
-					enqueue(mutation.target);
-					continue;
-				}
-				for (const node of mutation.addedNodes) {
-					enqueue(node);
+		// 已由统一观察器接管，此处仅做初始化翻译
+		enqueue(document.body);
+	}
+	
+	// ========== 设置面板已迁移到Extension侧边栏 ==========
+	// 设置面板UI不再在workbench.html中创建，由windsurf-better-extension提供
+
+	
+	// ========== 统一 MutationObserver（替代5个独立观察器，减少内存开销）==========
+	let _unifiedObserver = null;
+
+	function startUnifiedObserver() {
+		if (_unifiedObserver) return; // 只创建一次
+		_unifiedObserver = new MutationObserver((mutations) => {
+			// 汉化：处理新增/变更节点
+			if (settings.localizationEnabled && !_isTranslating) {
+				for (const mutation of mutations) {
+					if (mutation.type === 'characterData') {
+						enqueue(mutation.target);
+						continue;
+					}
+					if (mutation.type === 'attributes') {
+						enqueue(mutation.target);
+						continue;
+					}
+					for (const node of mutation.addedNodes) {
+						enqueue(node);
+					}
 				}
 			}
+			// 气泡
+			onBubblesMutation();
+			// 自动继续
+			onAutoContinueMutation();
+			// 完成提示音
+			onCompletionMutation();
+			// 对话队列
+			onChatQueueMutation();
+			// AI提问检测
+			detectAiQuestion();
 		});
-		
-		localizationObserver.observe(document.body, {
+		_unifiedObserver.observe(document.body, {
 			childList: true,
 			subtree: true,
 			characterData: true,
 			attributes: true,
 			attributeFilter: ATTRS_TO_TRANSLATE,
 		});
+		console.log(LOG_PREFIX + '统一观察器已启动');
 	}
-	
-	// ========== 统一设置面板 ==========
-	function injectPanelStyles() {
-		if (document.getElementById('ws-better-panel-css')) return;
-		const style = document.createElement('style');
-		style.id = 'ws-better-panel-css';
-		style.textContent = `
-.ws-better-toggle{position:fixed;top:30%;right:20px;width:32px;height:32px;border-radius:50%;background:rgba(128,128,128,.15);color:rgba(150,150,150,.6);border:1px solid rgba(128,128,128,.2);cursor:grab;display:flex;align-items:center;justify-content:center;font-size:15px;box-shadow:0 1px 4px rgba(0,0,0,.3);z-index:9999;transition:background .2s,color .2s,box-shadow .2s;user-select:none}.ws-better-toggle.dragging{cursor:grabbing;transition:none}
-.ws-better-toggle:hover{background:rgba(128,128,128,.25);color:rgba(180,180,180,.9);transform:scale(1.05);box-shadow:0 2px 8px rgba(0,0,0,.4)}
-.ws-better-panel{position:fixed;width:300px;background:#1e1e2e;border:1px solid rgba(255,255,255,.1);border-radius:12px;padding:16px;z-index:9999;box-shadow:0 8px 32px rgba(0,0,0,.4);color:#e5e7eb;font-size:13px;display:none;overflow:visible;max-height:80vh;overflow-y:auto}
-.ws-better-panel.open{display:block}
-.ws-better-panel h3{margin:0 0 12px;font-size:14px;color:#0ea5e9;display:flex;align-items:center;justify-content:space-between}
-.ws-better-close{background:none;border:none;color:#9ca3af;font-size:18px;cursor:pointer;padding:0 2px;line-height:1}
-.ws-better-close:hover{color:#e5e7eb}
-.ws-better-section{margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid rgba(255,255,255,.08)}
-.ws-better-section:last-child{margin-bottom:0;padding-bottom:0;border-bottom:none}
-.ws-better-section-title{font-size:12px;font-weight:600;color:#9ca3af;margin-bottom:8px;text-transform:uppercase;letter-spacing:0.5px}
-.ws-better-panel label{display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer}
-.ws-dd{position:relative;width:100%;margin-bottom:8px;box-sizing:border-box}
-.ws-dd-btn{width:100%;padding:6px 10px;border-radius:6px;border:1px solid rgba(255,255,255,.2);background:#2a2a3e;color:#e5e7eb;font-size:13px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;text-align:left;box-sizing:border-box}
-.ws-dd-btn:hover{border-color:rgba(255,255,255,.35)}
-.ws-dd-btn::after{content:'\\u25BE';font-size:10px;color:#9ca3af}
-.ws-dd-list{display:none;position:absolute;top:100%;left:0;width:100%;box-sizing:border-box;background:#2a2a3e;border:1px solid rgba(255,255,255,.15);border-radius:6px;margin-top:4px;max-height:200px;overflow-y:auto;z-index:10001;box-shadow:0 4px 16px rgba(0,0,0,.4);scrollbar-width:thin;scrollbar-color:#555 transparent}
-.ws-dd-list::-webkit-scrollbar{width:6px}
-.ws-dd-list::-webkit-scrollbar-track{background:transparent;border-radius:3px}
-.ws-dd-list::-webkit-scrollbar-thumb{background:#555;border-radius:3px}
-.ws-dd-list::-webkit-scrollbar-thumb:hover{background:#777}
-.ws-dd.open .ws-dd-list{display:block}
-.ws-dd-item{padding:6px 10px;color:#e5e7eb;cursor:pointer;font-size:13px}
-.ws-dd-item:hover{background:rgba(255,255,255,.1)}
-.ws-dd-item.active{background:rgba(14,165,233,.25);color:#0ea5e9}
-.monaco-list-row .label-name,.tab .label-name,.action-label,.monaco-button,.pane-header h3,.title-label span,.composite.title .title-label a,.tabs-container .tab .tab-label a{white-space:nowrap!important}
-`;
-		document.head.appendChild(style);
-	}
-	
-	function createSettingsUI() {
-		if (document.getElementById('ws-better-toggle')) return;
-		
-		injectPanelStyles();
-		injectBubblesStyles();
-		
-		const toggle = document.createElement('button');
-		toggle.id = 'ws-better-toggle';
-		toggle.className = 'ws-better-toggle';
-		toggle.textContent = '⚙️';
-		toggle.title = 'Windsurf Better Settings (拖拽移动)';
-		// 恢复位置
-		if (settings.togglePos) { toggle.style.top = settings.togglePos.top; toggle.style.left = settings.togglePos.left; toggle.style.right = 'auto'; }
-		// 拖拽逻辑（面板跟随在后面绑定）
-		let _dragging = false, _dragMoved = false, _dragStartX = 0, _dragStartY = 0;
-		let _onDragMove = null; // 将在面板创建后赋值
-		toggle.addEventListener('mousedown', e => { _dragging = true; _dragMoved = false; _dragStartX = e.clientX; _dragStartY = e.clientY; toggle.classList.add('dragging'); e.preventDefault(); });
-		document.addEventListener('mousemove', e => { if (_onDragMove) _onDragMove(e); });
-		document.addEventListener('mouseup', () => { if (!_dragging) return; _dragging = false; toggle.classList.remove('dragging'); const r = toggle.getBoundingClientRect(); settings.togglePos = { top: r.top + 'px', left: r.left + 'px' }; saveSettings(settings); });
-		
-		const panel = document.createElement('div');
-		panel.className = 'ws-better-panel';
-		panel.id = 'ws-better-panel';
-		
-		const title = document.createElement('h3');
-		const titleTxt = document.createElement('span');
-		titleTxt.textContent = '⚙️ Windsurf Better v' + VERSION;
-		title.appendChild(titleTxt);
-		const closeBtn = document.createElement('button');
-		closeBtn.className = 'ws-better-close';
-		closeBtn.textContent = '×';
-		closeBtn.addEventListener('click', () => panel.classList.remove('open'));
-		title.appendChild(closeBtn);
-		panel.appendChild(title);
-		
-		// 气泡设置区块
-		const bubblesSection = document.createElement('div');
-		bubblesSection.className = 'ws-better-section';
-		const bubblesTitle = document.createElement('div');
-		bubblesTitle.className = 'ws-better-section-title';
-		bubblesTitle.textContent = '气泡提示';
-		bubblesSection.appendChild(bubblesTitle);
-		
-		const bubblesEnable = document.createElement('label');
-		const bubblesCheck = document.createElement('input');
-		bubblesCheck.type = 'checkbox';
-		bubblesCheck.checked = settings.bubblesEnabled;
-		bubblesCheck.addEventListener('change', () => {
-			settings.bubblesEnabled = bubblesCheck.checked;
-			saveSettings(settings);
-			if (settings.bubblesEnabled) startBubblesObserving();
-			else if (bubblesObserver) { bubblesObserver.disconnect(); bubblesObserver = null; }
-		});
-		bubblesEnable.appendChild(bubblesCheck);
-		bubblesEnable.appendChild(document.createTextNode(' 启用气泡'));
-		bubblesSection.appendChild(bubblesEnable);
-		
-		const bubblesAutoSend = document.createElement('label');
-		const bubblesAutoCheck = document.createElement('input');
-		bubblesAutoCheck.type = 'checkbox';
-		bubblesAutoCheck.checked = settings.bubblesAutoSend;
-		bubblesAutoCheck.addEventListener('change', () => {
-			settings.bubblesAutoSend = bubblesAutoCheck.checked;
-			saveSettings(settings);
-		});
-		bubblesAutoSend.appendChild(bubblesAutoCheck);
-		bubblesAutoSend.appendChild(document.createTextNode(' 点击自动发送'));
-		bubblesSection.appendChild(bubblesAutoSend);
-		
-		function mkDropdown(label, items, current, onChange) {
-			const wrap = document.createElement('div');
-			wrap.style.marginTop = '8px';
-			const lbl = document.createElement('div');
-			lbl.textContent = label;
-			wrap.appendChild(lbl);
-			const dd = document.createElement('div');
-			dd.className = 'ws-dd';
-			const btn = document.createElement('div');
-			btn.className = 'ws-dd-btn';
-			btn.textContent = (items.find(i => i.value === current) || items[0]).label;
-			const list = document.createElement('div');
-			list.className = 'ws-dd-list';
-			items.forEach(item => {
-				const d = document.createElement('div');
-				d.className = 'ws-dd-item' + (item.value === current ? ' active' : '');
-				d.textContent = item.label;
-				d.dataset.val = item.value;
-				d.addEventListener('click', e => {
-					e.stopPropagation();
-					btn.textContent = item.label;
-					list.querySelectorAll('.ws-dd-item').forEach(x => x.classList.remove('active'));
-					d.classList.add('active');
-					dd.classList.remove('open');
-					onChange(item.value);
-				});
-				list.appendChild(d);
-			});
-			btn.addEventListener('click', e => { e.stopPropagation(); dd.classList.toggle('open'); });
-			document.addEventListener('click', () => dd.classList.remove('open'));
-			dd.appendChild(btn);
-			dd.appendChild(list);
-			wrap.appendChild(dd);
-			return wrap;
-		}
-		
-		const themeDd = mkDropdown('主题:', BUBBLE_THEMES.map(t => ({ value: t.id, label: t.name })), settings.bubblesTheme, v => {
-			settings.bubblesTheme = v;
-			saveSettings(settings);
-		});
-		bubblesSection.appendChild(themeDd);
-		
-		const shapeNames = { pill: '胶囊', rounded: '圆角', soft: '柔和', sharp: '直角' };
-		const shapeDd = mkDropdown('形状:', BUBBLE_SHAPES.map(s => ({ value: s.id, label: shapeNames[s.id] || s.id })), settings.bubblesShape, v => {
-			settings.bubblesShape = v;
-			saveSettings(settings);
-		});
-		bubblesSection.appendChild(shapeDd);
-		
-		panel.appendChild(bubblesSection);
-		
-		// 汉化设置区块
-		const locSection = document.createElement('div');
-		locSection.className = 'ws-better-section';
-		const locTitle = document.createElement('div');
-		locTitle.className = 'ws-better-section-title';
-		locTitle.textContent = '界面汉化';
-		locSection.appendChild(locTitle);
-		
-		const locEnable = document.createElement('label');
-		const locCheck = document.createElement('input');
-		locCheck.type = 'checkbox';
-		locCheck.checked = settings.localizationEnabled;
-		locCheck.addEventListener('change', () => {
-			settings.localizationEnabled = locCheck.checked;
-			saveSettings(settings);
-			if (settings.localizationEnabled) {
-				startLocalizationObserver();
-				enqueue(document.body);
-			} else if (localizationObserver) {
-				localizationObserver.disconnect();
-				localizationObserver = null;
-			}
-		});
-		locEnable.appendChild(locCheck);
-		locEnable.appendChild(document.createTextNode(' 启用汉化'));
-		locSection.appendChild(locEnable);
-		
-		panel.appendChild(locSection);
-		
-		// 自动继续区块
-		const acSection = document.createElement('div');
-		acSection.className = 'ws-better-section';
-		const acTitle = document.createElement('div');
-		acTitle.className = 'ws-better-section-title';
-		acTitle.textContent = '自动操作';
-		acSection.appendChild(acTitle);
-		
-		const acEnable = document.createElement('label');
-		const acCheck = document.createElement('input');
-		acCheck.type = 'checkbox';
-		acCheck.checked = settings.autoContinueEnabled;
-		acCheck.addEventListener('change', () => {
-			settings.autoContinueEnabled = acCheck.checked;
-			saveSettings(settings);
-			if (settings.autoContinueEnabled) startAutoContinue();
-			else if (autoContinueObserver) { autoContinueObserver.disconnect(); autoContinueObserver = null; }
-		});
-		acEnable.appendChild(acCheck);
-		acEnable.appendChild(document.createTextNode(' 回复截断时自动继续'));
-		acSection.appendChild(acEnable);
 
-		// 多轮对话队列
-		const cqEnable = document.createElement('label');
-		const cqCheck = document.createElement('input');
-		cqCheck.type = 'checkbox';
-		cqCheck.checked = settings.chatQueueEnabled;
-		cqCheck.addEventListener('change', () => {
-			settings.chatQueueEnabled = cqCheck.checked;
-			saveSettings(settings);
-			updateQueueUI();
-		});
-		cqEnable.appendChild(cqCheck);
-		cqEnable.appendChild(document.createTextNode(' 多轮对话队列'));
-		acSection.appendChild(cqEnable);
-
-		// 队列输入区
-		const cqBox = document.createElement('div');
-		cqBox.id = 'ws-cq-box';
-		cqBox.style.cssText = 'margin-top:8px;display:none;';
-		const cqInput = document.createElement('textarea');
-		cqInput.id = 'ws-cq-input';
-		cqInput.placeholder = '每行一条对话，按顺序执行\n例如:\n帮我写一个函数\n帮我添加注释\n帮我测试';
-		cqInput.style.cssText = 'width:100%;height:80px;padding:6px 8px;border-radius:6px;border:1px solid rgba(255,255,255,.2);background:#2a2a3e;color:#e5e7eb;font-size:12px;resize:vertical;box-sizing:border-box;';
-		cqBox.appendChild(cqInput);
-		const cqBtnRow = document.createElement('div');
-		cqBtnRow.style.cssText = 'margin-top:4px;display:flex;gap:6px;';
-		const cqAddBtn = document.createElement('button');
-		cqAddBtn.textContent = '加入队列';
-		cqAddBtn.style.cssText = 'flex:1;padding:4px 8px;border-radius:6px;border:1px solid rgba(255,255,255,.2);background:#2a2a3e;color:#0ea5e9;font-size:12px;cursor:pointer;';
-		cqAddBtn.addEventListener('click', () => {
-			const text = cqInput.value.trim();
-			if (!text) return;
-			const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-			for (const line of lines) _chatQueue.push(line);
-			cqInput.value = '';
-			updateQueueUI();
-			console.log(LOG_PREFIX + '[ChatQueue] 添加' + lines.length + '条到队列, 当前队列长度=' + _chatQueue.length);
-			// 如果当前没有在等待回复，立即发送第一条
-			if (!_chatQueueProcessing && _chatQueue.length > 0) processQueue();
-		});
-		cqBtnRow.appendChild(cqAddBtn);
-		const cqClearBtn = document.createElement('button');
-		cqClearBtn.textContent = '清空';
-		cqClearBtn.style.cssText = 'padding:4px 8px;border-radius:6px;border:1px solid rgba(255,255,255,.2);background:#2a2a3e;color:#f56c6c;font-size:12px;cursor:pointer;';
-		cqClearBtn.addEventListener('click', () => {
-			_chatQueue.length = 0;
-			_chatQueueProcessing = false;
-			updateQueueUI();
-			console.log(LOG_PREFIX + '[ChatQueue] 队列已清空');
-		});
-		cqBtnRow.appendChild(cqClearBtn);
-		cqBox.appendChild(cqBtnRow);
-		// 队列状态显示
-		const cqStatus = document.createElement('div');
-		cqStatus.id = 'ws-cq-status';
-		cqStatus.style.cssText = 'margin-top:6px;font-size:11px;color:#9ca3af;max-height:60px;overflow-y:auto;';
-		cqBox.appendChild(cqStatus);
-		acSection.appendChild(cqBox);
-
-		function updateQueueUI() {
-			cqBox.style.display = settings.chatQueueEnabled ? 'block' : 'none';
-			const statusEl = document.getElementById('ws-cq-status');
-			if (statusEl) {
-				if (_chatQueue.length === 0) {
-					statusEl.textContent = '队列为空';
-				} else {
-					statusEl.innerHTML = '队列(' + _chatQueue.length + '条): ' + _chatQueue.map((q, i) => '<span style="color:' + (i === 0 && _chatQueueProcessing ? '#0ea5e9' : '#9ca3af') + '">' + (i + 1) + '.' + q.substring(0, 20) + (q.length > 20 ? '...' : '') + '</span>').join(' → ');
-				}
-			}
-		}
-
-		panel.appendChild(acSection);
-		
-		// 完成提示音区块
-		const nsSection = document.createElement('div');
-		nsSection.className = 'ws-better-section';
-		const nsTitle = document.createElement('div');
-		nsTitle.className = 'ws-better-section-title';
-		nsTitle.textContent = '完成提示音';
-		nsSection.appendChild(nsTitle);
-		
-		const nsEnable = document.createElement('label');
-		const nsCheck = document.createElement('input');
-		nsCheck.type = 'checkbox';
-		nsCheck.checked = settings.notificationSoundEnabled;
-		nsCheck.addEventListener('change', () => {
-			settings.notificationSoundEnabled = nsCheck.checked;
-			saveSettings(settings);
-			if (settings.notificationSoundEnabled) startNotificationSound();
-			else if (_completionObserver) { _completionObserver.disconnect(); _completionObserver = null; }
-		});
-		nsEnable.appendChild(nsCheck);
-		nsEnable.appendChild(document.createTextNode(' AI回复完成时播放提示音'));
-		nsSection.appendChild(nsEnable);
-		
-		// 音色选择
-		const presetRow = document.createElement('div');
-		presetRow.style.cssText = 'margin-top:8px;display:flex;align-items:center;gap:8px;';
-		presetRow.appendChild(document.createTextNode('音色:'));
-		const presetSel = document.createElement('select');
-		presetSel.style.cssText = 'flex:1;padding:4px 8px;border-radius:6px;border:1px solid rgba(255,255,255,.2);background:#2a2a3e;color:#e5e7eb;font-size:12px;';
-		const PRESETS = [
-			{ id: 'chime', name: '清脆和弦' },
-			{ id: 'ding', name: '叮咚' },
-			{ id: 'pop', name: '气泡' },
-			{ id: 'alert', name: '提醒' },
-		];
-		PRESETS.forEach(p => { const o = document.createElement('option'); o.value = p.id; o.textContent = p.name; if (p.id === settings.notificationSoundPreset) o.selected = true; presetSel.appendChild(o); });
-		presetSel.addEventListener('change', () => { settings.notificationSoundPreset = presetSel.value; saveSettings(settings); playCompletionSound(); });
-		presetRow.appendChild(presetSel);
-		nsSection.appendChild(presetRow);
-		// 音量
-		const volRow = document.createElement('div');
-		volRow.style.cssText = 'margin-top:6px;display:flex;align-items:center;gap:8px;';
-		volRow.appendChild(document.createTextNode('音量:'));
-		const volSlider = document.createElement('input');
-		volSlider.type = 'range'; volSlider.min = '0'; volSlider.max = '1'; volSlider.step = '0.05';
-		volSlider.value = settings.notificationSoundVolume;
-		volSlider.style.cssText = 'flex:1;';
-		volSlider.addEventListener('input', () => { settings.notificationSoundVolume = parseFloat(volSlider.value); saveSettings(settings); });
-		volRow.appendChild(volSlider);
-		nsSection.appendChild(volRow);
-		// 试听
-		const nsTestBtn = document.createElement('button');
-		nsTestBtn.textContent = '试听';
-		nsTestBtn.style.cssText = 'margin-top:6px;padding:3px 12px;border-radius:6px;border:1px solid rgba(255,255,255,.2);background:#2a2a3e;color:#e5e7eb;font-size:12px;cursor:pointer;';
-		nsTestBtn.addEventListener('click', () => playCompletionSound());
-		nsSection.appendChild(nsTestBtn);
-
-		// 系统通知
-		const sysNotifyRow = document.createElement('label');
-		const sysNotifyCheck = document.createElement('input');
-		sysNotifyCheck.type = 'checkbox';
-		sysNotifyCheck.checked = settings.notificationSystemEnabled;
-		sysNotifyCheck.addEventListener('change', () => {
-			settings.notificationSystemEnabled = sysNotifyCheck.checked;
-			saveSettings(settings);
-			if (sysNotifyCheck.checked) showCompletionNotification(); // 测试
-		});
-		sysNotifyRow.appendChild(sysNotifyCheck);
-		sysNotifyRow.appendChild(document.createTextNode(' 系统通知'));
-		nsSection.appendChild(sysNotifyRow);
-
-		panel.appendChild(nsSection);
-
-		// 刷新插件按钮
-		const reloadSection = document.createElement('div');
-		reloadSection.className = 'ws-better-section';
-		const reloadBtn = document.createElement('button');
-		reloadBtn.textContent = '🔄 刷新插件';
-		reloadBtn.style.cssText = 'width:100%;padding:8px 0;border-radius:8px;border:1px solid rgba(59,130,246,.4);background:rgba(59,130,246,.15);color:#60a5fa;font-size:13px;font-weight:600;cursor:pointer;transition:all .2s;';
-		reloadBtn.addEventListener('mouseenter', () => { reloadBtn.style.background = 'rgba(59,130,246,.3)'; });
-		reloadBtn.addEventListener('mouseleave', () => { reloadBtn.style.background = 'rgba(59,130,246,.15)'; });
-		reloadBtn.addEventListener('click', () => {
-			reloadBtn.textContent = '⏳ 刷新中...';
-			reloadBtn.style.pointerEvents = 'none';
-			console.log(LOG_PREFIX + '[Reload] 用户点击刷新插件，3秒后重载窗口...');
-			setTimeout(() => {
-				try {
-					// 优先用VSCode命令重载窗口（最稳定）
-					if (typeof vscode !== 'undefined' && vscode.postMessage) {
-						vscode.postMessage({ command: 'workbench.action.reloadWindow' });
-					} else {
-						// 兜底：直接重载页面
-						location.reload();
-					}
-				} catch {
-					location.reload();
-				}
-			}, 3000);
-		});
-		const reloadHint = document.createElement('div');
-		reloadHint.style.cssText = 'font-size:11px;color:#6b7280;margin-top:4px;text-align:center;';
-		reloadHint.textContent = '修改插件后点击此按钮使更新生效';
-		reloadSection.appendChild(reloadBtn);
-		reloadSection.appendChild(reloadHint);
-		panel.appendChild(reloadSection);
-
-		// 面板跟随齿轮位置
-		const positionPanel = () => {
-			const r = toggle.getBoundingClientRect();
-			let left = r.left;
-			let top = r.bottom + 8;
-			if (left + 300 > window.innerWidth) left = window.innerWidth - 308;
-			if (top + 400 > window.innerHeight) top = r.top - 8 - panel.offsetHeight;
-			if (top < 0) top = 8;
-			if (left < 0) left = 8;
-			panel.style.left = left + 'px';
-			panel.style.top = top + 'px';
-		};
-
-		toggle.addEventListener('click', () => { if (!_dragMoved) { panel.classList.toggle('open'); if (panel.classList.contains('open')) positionPanel(); } });
-
-		// 拖拽移动 + 面板跟随（统一 mousemove）
-		_onDragMove = e => {
-			if (!_dragging) return;
-			const dx = e.clientX - _dragStartX, dy = e.clientY - _dragStartY;
-			if (Math.abs(dx) > 3 || Math.abs(dy) > 3) _dragMoved = true;
-			if (_dragMoved) {
-				const r = toggle.getBoundingClientRect();
-				toggle.style.left = Math.max(0, Math.min(window.innerWidth - 32, r.left + dx)) + 'px';
-				toggle.style.top = Math.max(0, Math.min(window.innerHeight - 32, r.top + dy)) + 'px';
-				toggle.style.right = 'auto';
-				_dragStartX = e.clientX;
-				_dragStartY = e.clientY;
-				if (panel.classList.contains('open')) positionPanel();
-			}
-		};
-
-		document.body.appendChild(toggle);
-		document.body.appendChild(panel);
-	}
-	
 	// ========== 多轮对话队列 ==========
 	let _chatQueue = [];
 	let _chatQueueProcessing = false;
-	let _chatQueueObserver = null;
+	let _chatQueueObserverActive = false;
 	let _lastQueueStepCount = 0;
+	let _lastQueueCheckTime = 0;
+	let _queuePausedForContinue = false; // 配额耗尽/截断时暂停队列，等自动继续恢复后再继续
 
 	function sendQueueMessage(text) {
 		const ok = setInputText(text);
@@ -1913,6 +1833,7 @@
 		if (_chatQueue.length === 0) {
 			_chatQueueProcessing = false;
 			console.log(LOG_PREFIX + '[ChatQueue] 队列已空，停止处理');
+			notifyEvent('queueDone', '所有对话已处理完毕');
 			return;
 		}
 		_chatQueueProcessing = true;
@@ -1932,20 +1853,25 @@
 			if (_chatQueue.length === 0) {
 				statusEl.textContent = '等待回复中...';
 			} else {
-				statusEl.innerHTML = '等待回复中... | 剩余' + _chatQueue.length + '条: ' + _chatQueue.map((q, i) => '<span style="color:#9ca3af">' + (i + 1) + '.' + q.substring(0, 15) + (q.length > 15 ? '...' : '') + '</span>').join(' → ');
+				setTrustedHTML(statusEl, '等待回复中... | 剩余' + _chatQueue.length + '条: ' + _chatQueue.map((q, i) => '<span style="color:#9ca3af">' + (i + 1) + '.' + q.substring(0, 15) + (q.length > 15 ? '...' : '') + '</span>').join(' → '));
 			}
 		}
 	}
 
 	function startChatQueueObserver() {
-		if (_chatQueueObserver) { _chatQueueObserver.disconnect(); _chatQueueObserver = null; }
-		let _lastQueueCheckTime = 0;
-		_chatQueueObserver = new MutationObserver(() => {
-			if (!_chatQueueProcessing || _chatQueue.length === 0) return;
-			// 节流3秒
-			const now = Date.now();
-			if (now - _lastQueueCheckTime < 3000) return;
-			_lastQueueCheckTime = now;
+		_chatQueueObserverActive = true;
+		// 由统一观察器接管触发
+		console.log(LOG_PREFIX + '[ChatQueue] 观察器已启动');
+	}
+
+	function onChatQueueMutation() {
+		if (!_chatQueueObserverActive || !_chatQueueProcessing || _chatQueue.length === 0) return;
+		// 配额耗尽暂停期间，不处理队列（等自动继续恢复A的回答后，_queuePausedForContinue会被重置）
+		if (_queuePausedForContinue) return;
+		// 节流3秒
+		const now = Date.now();
+		if (now - _lastQueueCheckTime < 3000) return;
+		_lastQueueCheckTime = now;
 			// 检测AI是否回复完成：step数量增加了
 			const allSteps = document.querySelectorAll('[data-step-index]');
 			const currentSteps = allSteps.length;
@@ -1957,61 +1883,71 @@
 				if (idx > maxIdx) { maxIdx = idx; lastStep = s; }
 			}
 			if (!lastStep) return;
-			// 检查是否是配额耗尽中断
-			const EXHAUST_KEYWORD = 'your included usage quota is exhausted';
-			const lastText = (lastStep.textContent || '').toLowerCase().replace(/\s+/g, ' ').trim();
-			if (lastText.includes(EXHAUST_KEYWORD)) {
+			// 检查是否是配额耗尽中断或截断
+			// 使用统一检测函数：同时搜索banner浮层和step元素
+			const quotaResult = detectQuotaExhausted();
+			const TRUNCATE_KEYWORDS_CQ = ['继续', 'continue'];
+			const lastTextOrig = (lastStep.textContent || '').trim();
+			const last5 = lastTextOrig.slice(-5);
+			const last8 = lastTextOrig.slice(-8);
+			const last10 = lastTextOrig.slice(-10);
+			const normalEndings = ['.', '。', '！', '？', '!', '?', ':', '：', ')', '）', ']', '】', '`', '"', "'"];
+			const endsNormally = normalEndings.some(e => lastTextOrig.endsWith(e));
+			const isTruncated = !endsNormally && (last5.includes('继续') || last8.toLowerCase().includes('continue'));
+			if (quotaResult.detected || isTruncated) {
 				// 检查AI是否还在生成中（button[type="submit"]里有svg.lucide-square=生成中）
 				let isGenerating = false;
 				for (const btn of document.querySelectorAll('button[type="submit"]')) {
 					if (btn.querySelector('svg.lucide-square')) { isGenerating = true; break; }
 				}
 				if (isGenerating) {
-					console.log(LOG_PREFIX + '[ChatQueue] ⚠️配额耗尽但AI仍在生成中，等待...');
+					console.log(LOG_PREFIX + '[ChatQueue] ⚠️配额耗尽/截断但AI仍在生成中，等待...');
 					_lastQueueStepCount = currentSteps;
 					return;
 				}
-				// AI已停止，检查队列首条是否是"继续"
-				if (_chatQueue.length > 0 && _chatQueue[0].trim() === '继续') {
-					// 删除队列中的"继续"，让自动继续机制通过输入框发送（更稳定：有重试/冷却/防重复）
-					_chatQueue.shift();
-					console.log(LOG_PREFIX + '[ChatQueue] 🗑️队列首条是"继续"，已删除，交给自动继续机制发送');
-					// 更新UI
-					const statusEl = document.getElementById('ws-cq-status');
-					if (statusEl) {
-						if (_chatQueue.length === 0) statusEl.textContent = '等待自动继续中...';
-						else statusEl.innerHTML = '等待自动继续中... | 剩余' + _chatQueue.length + '条';
-					}
-				} else {
-					console.log(LOG_PREFIX + '[ChatQueue] ⚠️AI因配额耗尽中断，等待自动继续处理...');
+				// 关键修复：配额耗尽/截断时，暂停队列，完全交给自动继续机制发送"继续"
+				// 不要让队列自己发"继续"，否则可能和自动继续冲突或发错消息
+				_queuePausedForContinue = true;
+				console.log(LOG_PREFIX + '[ChatQueue] ⏸️配额耗尽/截断，暂停队列，等待自动继续恢复... (队列中还有' + _chatQueue.length + '条消息)');
+				// 更新UI
+				const statusEl = document.getElementById('ws-cq-status');
+				if (statusEl) {
+					if (_chatQueue.length === 0) statusEl.textContent = '等待自动继续中...';
+					else setTrustedHTML(statusEl, '⏸️等待自动继续恢复... | 剩余' + _chatQueue.length + '条');
 				}
 				_lastQueueStepCount = currentSteps;
-				// 等自动继续发送后，AI会继续回复，观察器会再次触发检测
-				// 设一个定时器，在自动继续发送后60秒如果还没恢复，检查是否需要继续处理队列
-				setTimeout(() => {
-					if (!_chatQueueProcessing || _chatQueue.length === 0) return;
-					// 检查最后消息是否还是配额耗尽（自动继续可能失败了）
+				// 定时检查自动继续是否恢复了AI回复
+				const checkResume = () => {
+					if (!_queuePausedForContinue) return; // 已恢复
 					const stepsNow2 = document.querySelectorAll('[data-step-index]');
+					// 使用统一检测函数检查banner+step
+					const quotaResult2 = detectQuotaExhausted();
 					let lastStep2 = null, maxIdx2 = -1;
 					for (const s of stepsNow2) {
 						const idx = parseInt(s.getAttribute('data-step-index') || '0');
 						if (idx > maxIdx2) { maxIdx2 = idx; lastStep2 = s; }
 					}
-					if (lastStep2) {
-						const txt2 = (lastStep2.textContent || '').toLowerCase().replace(/\s+/g, ' ').trim();
-						if (txt2.includes(EXHAUST_KEYWORD)) {
-							console.log(LOG_PREFIX + '[ChatQueue] ⚠️60秒后仍配额耗尽，自动继续可能失败，尝试手动发送继续');
-							// 自动继续失败，队列自己发"继续"
-							_chatQueue.unshift('继续');
-							processQueue();
-						} else {
-							// 自动继续成功了，AI已回复，继续处理队列
-							console.log(LOG_PREFIX + '[ChatQueue] ✅自动继续成功，继续处理队列');
-							_lastQueueStepCount = stepsNow2.length;
-							setTimeout(() => processQueue(), 2000);
-						}
+					if (!lastStep2) { setTimeout(checkResume, 10000); return; }
+					const last5_2 = (lastStep2.textContent || '').trim().slice(-5);
+					const last8_2 = (lastStep2.textContent || '').trim().slice(-8);
+					const endsNormally2 = normalEndings.some(e => (lastStep2.textContent || '').trim().endsWith(e));
+					const stillTruncated = !endsNormally2 && (last5_2.includes('继续') || last8_2.toLowerCase().includes('continue'));
+					if (quotaResult2.detected || stillTruncated) {
+						// 仍然配额耗尽，自动继续可能失败或还在冷却中，继续等待
+						console.log(LOG_PREFIX + '[ChatQueue] ⏳仍配额耗尽，继续等待自动继续...');
+						setTimeout(checkResume, 15000);
+					} else if (stepsNow2.length > currentSteps) {
+						// AI有了新回复（step数量增加了），说明自动继续成功
+						console.log(LOG_PREFIX + '[ChatQueue] ✅自动继续成功，AI已恢复回复，等A回答完成后继续队列');
+						_queuePausedForContinue = false;
+						_lastQueueStepCount = stepsNow2.length;
+						// 不立即processQueue，等A的回答完全结束后onChatQueueMutation会自动触发
+					} else {
+						// 没有新回复但也不耗尽了，可能在过渡中
+						setTimeout(checkResume, 10000);
 					}
-				}, 60000);
+				};
+				setTimeout(checkResume, 20000); // 20秒后开始检查
 				return;
 			}
 			// 简单判断AI是否完成：step-index增加了且不含exhausted
@@ -2027,26 +1963,27 @@
 				_lastQueueStepCount = currentSteps;
 				setTimeout(() => processQueue(), 1500);
 			}, 5000);
-		});
-		_chatQueueObserver.observe(document.body, { childList: true, subtree: true });
-		console.log(LOG_PREFIX + '[ChatQueue] 观察器已启动');
 	}
 
 	// ========== 自动继续 ==========
-	let autoContinueObserver = null;
 	let _quotaContinueCooldown = false;
 	let _isColdStart = true;
-	let _lastAutoContinueCheck = 0;
+	let _lastAutoContinueThrottle = 0; // 2秒节流（MutationObserver刷屏防护）
+	let _lastAutoContinueCheck = 0;     // 15秒最小间隔（防连续触发，AI慢时避免重复发送）
+	let _autoContinueActive = false;
+	let _tryClickFn = null; // 闭包引用
+	let _autoContinueSending = false; // 标记：自动继续正在发送"继续"，完成提示音应忽略此期间的square消失
+	let _lastQuotaBannerHash = 0;      // 上次处理的banner hash，防止同一个banner重复触发
 	const _windowId = 'ws-' + Date.now() + '-' + Math.random().toString(36).substring(2, 8);
 	function startAutoContinue() {
-		if (autoContinueObserver) { autoContinueObserver.disconnect(); autoContinueObserver = null; }
 		if (!settings.autoContinueEnabled) return;
+		_autoContinueActive = true;
 		const tryClick = () => {
 			if (!settings.autoContinueEnabled) return;
 			// 节流：2秒内不重复检测（避免MutationObserver刷屏）
 			const now2 = Date.now();
-			if (now2 - _lastAutoContinueCheck < 2000) return;
-			_lastAutoContinueCheck = now2;
+			if (now2 - _lastAutoContinueThrottle < 2000) return;
+			_lastAutoContinueThrottle = now2;
 			if (!settings.autoContinueEnabled) return;
 			// 1. 原有逻辑：检测 "Continue response" / "继续回复" 按钮
 			const btns = document.querySelectorAll('button, [role="button"]');
@@ -2060,119 +1997,219 @@
 			}
 			// 2. 新增逻辑：检测配额耗尽提示，检查配额余额后自动输入"继续"并发送
 			// 如果用户正在输入（输入框有焦点且有内容），不触发自动继续
+			// 关键修复：检测用户输入时，还要检查submit按钮状态
+			// arrow-up + 无cursor-not-allowed = 用户已输入文字，此时不应触发自动继续
 			const activeEl = document.activeElement;
+			let userIsTyping = false;
+			// 检查1: 输入框有焦点且有非"继续"内容
 			if (activeEl && (activeEl.getAttribute('data-lexical-editor') === 'true' || activeEl.contentEditable === 'true' || activeEl.tagName === 'TEXTAREA' || activeEl.tagName === 'INPUT')) {
 				const activeText = (activeEl.textContent || activeEl.value || '').replace(/\u200B/g, '').trim();
 				if (activeText.length > 0 && activeText !== '继续') {
+					userIsTyping = true;
 					console.log(LOG_PREFIX + '[AutoContinue] ✋用户正在输入("' + activeText.substring(0, 30) + '...")，跳过自动继续');
-					return;
 				}
 			}
-			if (_quotaContinueCooldown) { console.log(LOG_PREFIX + '[AutoContinue] ⏳冷却中，跳过'); return; }
-			// 冷却检查：30秒内不重复发送（用localStorage跨窗口共享）
+			// 检查2: submit按钮显示arrow-up且可点击(无cursor-not-allowed) = 用户已输入文字
+			if (!userIsTyping) {
+				for (const btn of document.querySelectorAll('button[type="submit"]')) {
+					const rect = btn.getBoundingClientRect();
+					if (rect.width === 0 || rect.height === 0) continue;
+					if (btn.querySelector('svg.lucide-arrow-up') && !btn.classList.contains('cursor-not-allowed') && !btn.classList.contains('opacity-50')) {
+						// 按钮可发送 = 输入框有内容，可能是用户输入的
+						// 但也可能是自动继续刚写入的，检查输入框内容
+						const inputEl = findInputEl();
+						if (inputEl) {
+							const inputText = (inputEl.textContent || inputEl.value || '').replace(/\u200B/g, '').trim();
+							if (inputText.length > 0 && inputText !== '继续') {
+								userIsTyping = true;
+								console.log(LOG_PREFIX + '[AutoContinue] ✋按钮可发送且输入框有用户文字("' + inputText.substring(0, 30) + '...")，跳过自动继续');
+								break;
+							}
+						}
+					}
+				}
+			}
+			if (userIsTyping) return;
+			// 5秒最小间隔：防止连续触发，同时快速检测配额
 			const now = Date.now();
+			if (now - _lastAutoContinueCheck < 5000) { return; }
+			if (_quotaContinueCooldown) { console.log(LOG_PREFIX + '[AutoContinue] ⏳冷却中，跳过'); return; }
+			// 冷却检查：10秒内不重复发送（用localStorage跨窗口共享）
 			const lastSend = parseInt(localStorage.getItem('ws-quota-last-send') || '0');
-			if (now - lastSend < 60000) { console.log(LOG_PREFIX + '[AutoContinue] ⏳全局冷却中(' + Math.round((60000 - (now - lastSend)) / 1000) + 's)，跳过'); return; }
+			if (now - lastSend < 10000) { console.log(LOG_PREFIX + '[AutoContinue] ⏳全局冷却中(' + Math.round((10000 - (now - lastSend)) / 1000) + 's)，跳过'); return; }
 			// 跨窗口锁：用localStorage，记录获得锁的窗口ID
 			const lockData = localStorage.getItem('ws-quota-lock');
 			if (lockData) {
 				try {
 					const lock = JSON.parse(lockData);
-					if (lock.id !== _windowId && now - lock.time < 30000) {
+					if (lock.id !== _windowId && now - lock.time < 60000) {
 						console.log(LOG_PREFIX + '[AutoContinue] 另一个窗口(' + lock.id + ')已获得锁，跳过');
 						return;
 					}
 				} catch {}
 			}
 
-			// 配额耗尽检测：找最后一条消息(data-step-index最大)，检查文本
-			const EXHAUST_KEYWORD = 'your included usage quota is exhausted';
+			// 配额耗尽检测：使用统一函数同时搜索banner浮层和step元素
+			// Windsurf新版本配额耗尽显示为顶部banner，不在[data-step-index]中
+			const quotaResult = detectQuotaExhausted();
 			const allSteps = document.querySelectorAll('[data-step-index]');
-			console.log(LOG_PREFIX + '[AutoContinue] 🔍检测: step-index元素=' + allSteps.length);
-			if (allSteps.length === 0) {
-				console.log(LOG_PREFIX + '[AutoContinue] ❌页面无data-step-index元素，跳过');
-				return;
-			}
-			// 找最大step-index（=最后一条消息）
+			console.log(LOG_PREFIX + '[AutoContinue] 🔍检测: quotaResult=' + quotaResult.detected + '(source=' + quotaResult.source + '), step-index元素=' + allSteps.length);
+
+			// 找最大step-index（=最后一条消息），用于截断检测和hash
 			let lastStep = null;
 			let maxIndex = -1;
 			for (const s of allSteps) {
 				const idx = parseInt(s.getAttribute('data-step-index') || '0');
 				if (idx > maxIndex) { maxIndex = idx; lastStep = s; }
 			}
-			if (!lastStep) {
-				console.log(LOG_PREFIX + '[AutoContinue] ❌未找到有效的step-index元素，跳过');
+			let lastTextOriginal = '';
+			let last10Chars = '';
+			if (lastStep) {
+				lastTextOriginal = (lastStep.textContent || '').trim();
+				last10Chars = lastTextOriginal.slice(-10);
+				console.log(LOG_PREFIX + '[AutoContinue] 📋最后消息(step=' + maxIndex + '): 文本前80字="' + lastTextOriginal.substring(0, 80) + '..." | 最后10字="' + last10Chars + '"');
+			}
+
+			// 判断1: 配额耗尽（banner或step）
+			const isQuotaExhausted = quotaResult.detected;
+			// 判断2: 回复截断（严格匹配：关键词必须在末尾，且回复未以正常标点结束）
+			const last5 = lastTextOriginal.slice(-5);
+			const last8 = lastTextOriginal.slice(-8);
+			const normalEndings = ['.', '。', '！', '？', '!', '?', ':', '：', ')', '）', ']', '】', '`', '"', "'"];
+			const endsNormally = normalEndings.some(e => lastTextOriginal.endsWith(e));
+			const isTruncated = !endsNormally && (last5.includes('继续') || last8.toLowerCase().includes('continue'));
+
+			if (!isQuotaExhausted && !isTruncated) {
+				console.log(LOG_PREFIX + '[AutoContinue] ❌无配额耗尽banner/step且无截断，正常完成不触发');
 				return;
 			}
-			// 检查最后一条消息的文本是否包含配额耗尽关键词
-			const lastText = (lastStep.textContent || '').toLowerCase().replace(/\s+/g, ' ').trim();
-			console.log(LOG_PREFIX + '[AutoContinue] 📋最后消息(step=' + maxIndex + '): 文本前80字="' + lastText.substring(0, 80) + '..."');
-			if (!lastText.includes(EXHAUST_KEYWORD)) {
-				console.log(LOG_PREFIX + '[AutoContinue] ❌最后消息不含"' + EXHAUST_KEYWORD + '"，正常完成不触发');
+
+			// 配额余额检查：如果配额真正耗尽（无余额），不应继续发送
+			if (isQuotaExhausted && isQuotaTrulyExhausted()) {
+				console.log(LOG_PREFIX + '[AutoContinue] 🚫配额真正耗尽，放弃自动继续，通知用户');
+				notifyEvent('quotaExhaust', '配额已耗尽，无法自动继续，请充值或等待配额重置');
+				_quotaContinueCooldown = true;
+				// 5分钟后重置冷却，允许再次尝试（可能配额已重置）
+				setTimeout(() => { _quotaContinueCooldown = false; }, 300000);
 				return;
 			}
-			console.log(LOG_PREFIX + '[AutoContinue] ✅最后消息(step=' + maxIndex + ')含配额耗尽关键词，继续检查...');
+
+			const triggerReason = isQuotaExhausted ? '配额耗尽(source=' + quotaResult.source + ')' : '回复截断(末尾含"' + last10Chars + '")';
+			console.log(LOG_PREFIX + '[AutoContinue] ✅触发: ' + triggerReason);
 
 			// 防重复：记录已处理的alert签名（简单hash）
-			const alertText = (lastStep.textContent || '').substring(0, 100);
+			// 关键修复：handledKey存储时间戳，仅30秒内视为已处理
+			// 超过30秒说明"继续"可能没发送成功，需要重试
+			// 使用banner或step的文本作为hash源
+			const alertText = (quotaResult.element?.textContent || lastStep?.textContent || '').substring(0, 100);
 			let alertHash = 0;
 			for (let i = 0; i < alertText.length; i++) alertHash = ((alertHash << 5) - alertHash + alertText.charCodeAt(i)) | 0;
 			const handledKey = 'ws-quota-handled-' + alertHash;
-			if (localStorage.getItem(handledKey)) {
-				console.log(LOG_PREFIX + '[AutoContinue] ⏳已处理过的alert(hash=' + alertHash + ')，跳过');
-				return;
+			const handledValue = localStorage.getItem(handledKey);
+			if (handledValue) {
+				const handledTime = parseInt(handledValue);
+				if (!isNaN(handledTime) && (now - handledTime) < 30000) {
+					console.log(LOG_PREFIX + '[AutoContinue] ⏳已处理过的alert(hash=' + alertHash + ', ' + Math.round((30000 - (now - handledTime)) / 1000) + 's前)，跳过');
+					return;
+				}
+				// 超过30秒，说明之前的发送可能失败了，清除并重试
+				console.log(LOG_PREFIX + '[AutoContinue] ⚠️handledKey已过期(' + Math.round((now - handledTime) / 1000) + 's前)，清除并重试');
+				localStorage.removeItem(handledKey);
 			}
 
-			// 二次验证：确认最后消息内确实有 lucide-triangle-alert 图标和配额提示样式
-			// 真实DOM结构(新UI): div[data-step-index] > div > div.bg-neutral-500/20 > svg.lucide-triangle-alert + span
-			// 真实DOM结构(旧UI): div[data-step-index] > div > div.bg-red-600 > svg.lucide-triangle-alert + span
-			const hasAlertIcon = lastStep.querySelector('svg.lucide-triangle-alert');
-			const hasQuotaBg = lastStep.querySelector('[class*="bg-neutral-500/20"], [class*="bg-red-600"], [class*="bg-red-500"]');
-			console.log(LOG_PREFIX + '[AutoContinue] 🔍二次验证: alertIcon=' + !!hasAlertIcon + ', quotaBg=' + !!hasQuotaBg);
-			if (!hasAlertIcon && !hasQuotaBg) {
-				// 兜底：文本匹配已通过，可能UI结构变化，仍然继续但记录警告
-				console.log(LOG_PREFIX + '[AutoContinue] ⚠️无triangle-alert/quotaBg图标，但文本匹配通过，继续发送');
+			// 清理过期的 ws-quota-handled-* 键（保留最近10个，防止localStorage无限累积）
+			// 同时清理旧的'1'值（之前发送失败时设置的，不含时间戳）
+			try {
+				const handledKeys = [];
+				for (let i = 0; i < localStorage.length; i++) {
+					const k = localStorage.key(i);
+					if (k && k.startsWith('ws-quota-handled-')) {
+						const v = localStorage.getItem(k);
+						// 清理旧格式（值为'1'而非时间戳）或超过5分钟的记录
+						if (v === '1' || (parseInt(v) && (now - parseInt(v)) > 300000)) {
+							localStorage.removeItem(k);
+						} else {
+							handledKeys.push(k);
+						}
+					}
+				}
+				if (handledKeys.length > 10) {
+					handledKeys.sort();
+					for (let i = 0; i < handledKeys.length - 10; i++) {
+						localStorage.removeItem(handledKeys[i]);
+					}
+				}
+			} catch {}
+
+			// 二次验证（仅step来源的配额耗尽时检查图标，banner来源和截断不检查）
+			if (isQuotaExhausted && quotaResult.source === 'step' && lastStep) {
+				const hasAlertIcon = lastStep.querySelector('svg.lucide-triangle-alert');
+				const hasQuotaBg = lastStep.querySelector('[class*="bg-neutral-500/20"], [class*="bg-red-600"], [class*="bg-red-500"]');
+				console.log(LOG_PREFIX + '[AutoContinue] 🔍二次验证(step配额): alertIcon=' + !!hasAlertIcon + ', quotaBg=' + !!hasQuotaBg);
+				if (!hasAlertIcon && !hasQuotaBg) {
+					console.log(LOG_PREFIX + '[AutoContinue] ⚠️无triangle-alert/quotaBg图标，但文本匹配通过，继续发送');
+				}
+			} else if (isQuotaExhausted && quotaResult.source === 'banner') {
+				console.log(LOG_PREFIX + '[AutoContinue] 🔍banner来源配额耗尽，跳过图标二次验证（banner自带红/黄背景）');
+			} else {
+				console.log(LOG_PREFIX + '[AutoContinue] 🔍截断触发，跳过图标二次验证');
 			}
 
 			// 执行发送"继续"的逻辑（含重试）
 			const doSendContinue = (delay) => {
 				_quotaContinueCooldown = true;
+				_autoContinueSending = true; // 标记：自动继续正在发送，完成提示音应忽略
+				_lastAutoContinueCheck = Date.now(); // 更新5秒间隔标记
 				localStorage.setItem('ws-quota-lock', JSON.stringify({ id: _windowId, time: Date.now() }));
 				console.log(LOG_PREFIX + '[AutoContinue] ✅判定通过！配额耗尽且可继续，' + (delay > 0 ? '等待' + delay + 'ms后' : '立即') + '发送...(hash=' + alertHash + ', coldStart=' + _isColdStart + ')');
+				// 通知用户：检测到配额耗尽
+				notifyEvent('quotaExhaust', '正在自动换号继续...');
 
 				const trySend = (attempt) => {
-					if (attempt > 5) {
-						console.log(LOG_PREFIX + '[AutoContinue] 重试5次仍无法发送，放弃');
+					if (attempt > 8) {
+						console.log(LOG_PREFIX + '[AutoContinue] 重试8次仍无法发送，放弃');
 						_quotaContinueCooldown = false;
+						_autoContinueSending = false;
 						return;
 					}
 
+					// 检查用户是否正在输入——如果是，立即放弃
+					const preCheck = findInputEl();
+					if (preCheck) {
+						const preText = (preCheck.textContent || preCheck.value || '').replace(/\u200B/g, '').trim();
+						if (preText.length > 0 && preText !== '继续') {
+							console.log(LOG_PREFIX + '[AutoContinue] ✋检测到用户输入"' + preText.substring(0, 30) + '"，立即放弃重试');
+							_quotaContinueCooldown = false;
+							_autoContinueSending = false;
+							return;
+						}
+					}
+
+					// 检查输入框是否已有"继续"累积（防止"继续继续继续..."）
+					const preInput2 = findInputEl();
+					if (preInput2) {
+						const preText = (preInput2.textContent || preInput2.value || '').replace(/\u200B/g, '').trim();
+						if (preText.includes('继续') && preText !== '继续') {
+							console.log(LOG_PREFIX + '[AutoContinue] ⚠️输入框含异常文本"' + preText.substring(0, 30) + '"，先清空');
+							preInput2.focus();
+							try { document.execCommand('selectAll'); document.execCommand('delete'); } catch {}
+							try { document.execCommand('selectAll'); document.execCommand('delete'); } catch {}
+						}
+					}
+
 					// 检查是否已有排队的"继续"消息（避免重复发送）
-					// 真实DOM: <span>1 message queued</span> + 排队内容在 div.truncate.text-sm.opacity-80
 					const chatRoot2 = findChatRoot() || document;
-					// 方法1: 找 "N message(s) queued" span，检查同区域是否有"继续"
 					const allSpans = chatRoot2.querySelectorAll('span');
 					for (const span of allSpans) {
 						const spanText = (span.textContent || '').toLowerCase();
 						if (spanText.includes('message queued') || spanText.includes('messages queued') || spanText.includes('条消息排队中')) {
-							// 找到排队提示，检查整个排队区域是否含"继续"
-							// 真实DOM: span在 div.flex.flex-col.py-px 里，同层有排队的消息div
 							const queueArea = span.closest('div.flex.flex-col') || span.closest('[class*="flex-col"]') || span.parentElement?.parentElement;
 							if (queueArea && queueArea.textContent.includes('继续')) {
-								console.log(LOG_PREFIX + '[AutoContinue] 已有排队的"继续"消息(queueArea)，跳过');
+								console.log(LOG_PREFIX + '[AutoContinue] 已有排队的"继续"消息，跳过');
 								_quotaContinueCooldown = false;
+								_autoContinueSending = false;
 								return;
 							}
-						}
-					}
-					// 方法2: 找输入框placeholder含"排队"或"queued"
-					const placeholders = chatRoot2.querySelectorAll('span.truncate, [class*="truncate"]');
-					for (const p of placeholders) {
-						const pText = (p.textContent || '').toLowerCase();
-						if (pText.includes('queued') || pText.includes('排队')) {
-							console.log(LOG_PREFIX + '[AutoContinue] 输入框显示排队提示，可能有排队消息，跳过');
-							_quotaContinueCooldown = false;
-							return;
 						}
 					}
 
@@ -2192,48 +2229,83 @@
 						}
 					}
 
-					// 清空输入框并输入"继续"
+					// setInputText内部已有clearLexical清空逻辑，不需要额外预清空
+					console.log(LOG_PREFIX + '[AutoContinue] 📝第' + attempt + '次尝试: setInputText("继续")...');
 					const ok = setInputText('继续');
 					if (!ok) { console.log(LOG_PREFIX + '[AutoContinue] 找不到输入框，跳过'); _quotaContinueCooldown = false; return; }
 
+					// 验证文本是否真的写入了
+					const inputEl2 = findInputEl();
+					if (inputEl2) {
+						const textAfter = (inputEl2.textContent || inputEl2.value || '').replace(/\u200B/g, '').trim();
+						console.log(LOG_PREFIX + '[AutoContinue] 📝写入后验证: "' + textAfter.substring(0, 30) + '" (期望"继续")');
+						if (textAfter !== '继续') {
+							console.log(LOG_PREFIX + '[AutoContinue] ⚠️文本未正确写入，第' + attempt + '次重试...');
+							setTimeout(() => trySend(attempt + 1), 3000);
+							return;
+						}
+					}
+
+					// 写入成功后：先等Lexical同步状态，再发送
+					// 关键修复：Lexical需要时间处理InputEvent，立即按Enter可能被忽略
 					setTimeout(() => {
-						let sent = false;
-						for (const btn of document.querySelectorAll('button[type="submit"]')) {
-							const rect = btn.getBoundingClientRect();
-							if (rect.width === 0 || rect.height === 0) continue;
-							const arrowSvg = btn.querySelector('svg.lucide-arrow-up');
-							if (!arrowSvg) continue;
-							if (btn.classList.contains('cursor-not-allowed') || btn.classList.contains('opacity-50')) {
-								console.log(LOG_PREFIX + '[AutoContinue] 按钮仍不可点击，第' + attempt + '次重试...');
-								setTimeout(() => trySend(attempt + 1), 3000);
+						const inputEl3 = findInputEl();
+						if (inputEl3) {
+							inputEl3.focus();
+							// 优先点击submit按钮（比Enter更可靠）
+							let sentByBtn = false;
+							for (const btn of document.querySelectorAll('button[type="submit"]')) {
+								const rect = btn.getBoundingClientRect();
+								if (rect.width === 0 || rect.height === 0) continue;
+								const arrowSvg = btn.querySelector('svg.lucide-arrow-up');
+								if (!arrowSvg) continue;
+								if (btn.classList.contains('cursor-not-allowed') || btn.classList.contains('opacity-50')) continue;
+								btn.click();
+								sentByBtn = true;
+								console.log(LOG_PREFIX + '[AutoContinue] 📤已点击submit按钮');
+								break;
+							}
+							if (!sentByBtn) {
+								// 兜底：Enter键发送
+								const enterEvent = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true, composed: true, shiftKey: false, isComposing: false });
+								const targets = new Set([inputEl3, inputEl3.parentElement, inputEl3.closest('[role="textbox"]'), document.activeElement].filter(Boolean));
+								for (const t of targets) { t.dispatchEvent(enterEvent); }
+								for (const t of targets) { t.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true })); }
+								for (const t of targets) { t.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true })); }
+								console.log(LOG_PREFIX + '[AutoContinue] 📤已发送Enter键(兜底)');
+							}
+						}
+					}, 300); // 等300ms让Lexical同步状态
+
+					// 验证发送结果：300ms已发送，等800ms后检查输入框是否清空
+					setTimeout(() => {
+						const inputEl4 = findInputEl();
+						if (inputEl4) {
+							const textAfterSend = (inputEl4.textContent || inputEl4.value || '').replace(/\u200B/g, '').trim();
+							if (textAfterSend === '继续') {
+								// 输入框仍含"继续"，发送失败，重试
+								console.log(LOG_PREFIX + '[AutoContinue] ❌发送后输入框仍含"继续"，第' + attempt + '次重试...');
+								setTimeout(() => trySend(attempt + 1), 5000);
 								return;
 							}
-							btn.click();
-							console.log(LOG_PREFIX + '[AutoContinue] ✅已点击submit按钮');
-							sent = true;
-							localStorage.setItem(handledKey, '1');
-							localStorage.setItem('ws-quota-last-send', Date.now().toString());
-							playCompletionSound();
-							showCompletionNotification();
+						}
+						// ✅ 确认发送成功
+						console.log(LOG_PREFIX + '[AutoContinue] ✅✅发送"继续"成功！(attempt=' + attempt + ')');
+						localStorage.setItem(handledKey, Date.now().toString());
+						localStorage.setItem('ws-quota-last-send', Date.now().toString());
+						notifyEvent('autoContinue', '配额耗尽/截断，已自动发送"继续"');
+						_queuePausedForContinue = false;
 
-							// 恢复用户原有输入
-							if (hasUserInput) {
-								setTimeout(() => {
-									setInputText(userText);
-									console.log(LOG_PREFIX + '[AutoContinue] 已恢复用户输入');
-								}, 800);
-							}
-							// 通知队列观察器：自动继续已发送，更新step计数
-							_lastQueueStepCount = document.querySelectorAll('[data-step-index]').length;
-							break;
+						if (hasUserInput) {
+							setTimeout(() => {
+								setInputText(userText);
+								console.log(LOG_PREFIX + '[AutoContinue] 已恢复用户输入');
+							}, 800);
 						}
-						if (!sent) {
-							console.log(LOG_PREFIX + '[AutoContinue] 发送按钮不可点击，第' + attempt + '次重试，3秒后重试...');
-							setTimeout(() => trySend(attempt + 1), 3000);
-						} else {
-							setTimeout(() => { _quotaContinueCooldown = false; }, 60000);
-						}
-					}, 500);
+						_lastQueueStepCount = document.querySelectorAll('[data-step-index]').length;
+						// 发送成功后冷却60秒（防止AI慢时重复触发+多窗口误触）
+						setTimeout(() => { _quotaContinueCooldown = false; _autoContinueSending = false; }, 60000);
+					}, 800);
 				};
 				setTimeout(() => trySend(1), delay);
 			};
@@ -2242,75 +2314,70 @@
 			// 冷启动：插件刚初始化，服务可能还在连接，等15秒
 			// 非冷启动：运行中检测到配额耗尽，直接发送
 			if (_isColdStart) {
-				console.log(LOG_PREFIX + '[AutoContinue] 冷启动模式，等待15秒后发送');
-				doSendContinue(15000);
+				console.log(LOG_PREFIX + '[AutoContinue] 冷启动模式，等待5秒后发送');
+				doSendContinue(5000);
 				_isColdStart = false;
 			} else {
 				console.log(LOG_PREFIX + '[AutoContinue] 运行中模式，直接发送');
 				doSendContinue(0);
 			}
 		};
-		autoContinueObserver = new MutationObserver(() => {
-			if (settings.autoContinueEnabled) tryClick();
-		});
-		autoContinueObserver.observe(document.body, { childList: true, subtree: true });
+		_tryClickFn = tryClick; // 保存闭包引用
 		// 冷启动：延迟检查当前对话框是否已有配额耗尽提示
 		setTimeout(() => { tryClick(); }, 3000);
 		console.log(LOG_PREFIX + '[AutoContinue] ✅已启用');
 	}
 
-	// ========== 完成提示音 ==========
-	let _completionObserver = null;
+	function onAutoContinueMutation() {
+		if (!_autoContinueActive || !settings.autoContinueEnabled) return;
+		if (_tryClickFn) _tryClickFn();
+	}
+
+	// ========== 通知与提示音 ==========
+	let _completionActive = false;
 	let _wasGenerating = false;
-	let _lastSoundLog = 0;
 	let _pendingSoundTimer = null;
+	let _completionTimer = 0;
+	let _checkCompletionFn = null;
 
 	const SOUND_PRESETS = {
 		chime: [ { freq: 523.25, start: 0, dur: 0.12 }, { freq: 659.25, start: 0.13, dur: 0.12 }, { freq: 783.99, start: 0.26, dur: 0.18 } ],
 		ding: [ { freq: 880, start: 0, dur: 0.15 }, { freq: 660, start: 0.18, dur: 0.2 } ],
 		pop: [ { freq: 1200, start: 0, dur: 0.06 }, { freq: 900, start: 0.08, dur: 0.08 }, { freq: 1100, start: 0.18, dur: 0.06 } ],
 		alert: [ { freq: 440, start: 0, dur: 0.1 }, { freq: 440, start: 0.15, dur: 0.1 }, { freq: 880, start: 0.3, dur: 0.2 } ],
+		soft: [ { freq: 440, start: 0, dur: 0.2 }, { freq: 554.37, start: 0.22, dur: 0.25 } ],
+		warn: [ { freq: 600, start: 0, dur: 0.08 }, { freq: 400, start: 0.1, dur: 0.15 }, { freq: 600, start: 0.28, dur: 0.08 }, { freq: 400, start: 0.38, dur: 0.15 } ],
 	};
 
-	function showCompletionNotification() {
-		if (!settings.notificationSystemEnabled) return;
-		try {
-			// 请求通知权限
-			if (Notification.permission === 'default') {
-				Notification.requestPermission();
-			}
-			if (Notification.permission === 'granted') {
-				const n = new Notification('Windsurf Better', {
-					body: 'AI 回复已完成 ✅',
-					icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">✅</text></svg>',
-					silent: true, // 不播放系统默认提示音（已有自定义提示音）
-				});
-				// 5秒后自动关闭
-				setTimeout(() => n.close(), 5000);
-				console.log(LOG_PREFIX + '[Sound] 📢系统通知已发送');
-			} else {
-				console.log(LOG_PREFIX + '[Sound] 系统通知权限未授予: ' + Notification.permission);
-			}
-		} catch (e) {
-			console.log(LOG_PREFIX + '[Sound] 系统通知失败:', e);
-		}
-	}
+	// 事件类型定义：{ icon, defaultSound }
+	const NOTIFY_EVENTS = {
+		complete:     { icon: '✅', label: 'AI回复完成',     sound: 'chime' },
+		autoContinue: { icon: '🔄', label: '自动发送继续',   sound: 'soft' },
+		quotaExhaust: { icon: '⚠️', label: '配额耗尽',       sound: 'warn' },
+		queueDone:    { icon: '🎉', label: '队列全部完成',   sound: 'ding' },
+		aiQuestion:  { icon: '❓', label: 'AI需要你的输入', sound: 'alert' },
+	};
 
-	function playCompletionSound() {
+	let _audioCtx = null;
+
+	function playNotifySound(preset) {
+		if (!settings.notifySoundEnabled) return;
 		try {
-			const ctx = new (window.AudioContext || window.webkitAudioContext)();
-			const vol = (settings.notificationSoundVolume || 0.3) * 2.5; // 放大2.5倍
-			const notes = SOUND_PRESETS[settings.notificationSoundPreset] || SOUND_PRESETS.chime;
-			// 主增益节点，统一控制总音量
+			if (!_audioCtx || _audioCtx.state === 'closed') {
+				_audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+			}
+			if (_audioCtx.state === 'suspended') { _audioCtx.resume(); }
+			const ctx = _audioCtx;
+			const vol = (settings.notifySoundVolume || 0.3) * 2.5;
+			const notes = SOUND_PRESETS[preset || settings.notifySoundPreset] || SOUND_PRESETS.chime;
 			const master = ctx.createGain();
 			master.gain.value = 1;
 			master.connect(ctx.destination);
 			notes.forEach(n => {
 				const osc = ctx.createOscillator();
 				const gain = ctx.createGain();
-				osc.type = 'triangle'; // triangle比sine更响亮有穿透力
+				osc.type = 'triangle';
 				osc.frequency.value = n.freq;
-				// 先保持音量再衰减，让声音更饱满
 				gain.gain.setValueAtTime(0.001, ctx.currentTime + n.start);
 				gain.gain.exponentialRampToValueAtTime(vol, ctx.currentTime + n.start + 0.01);
 				gain.gain.setValueAtTime(vol, ctx.currentTime + n.start + n.dur * 0.6);
@@ -2320,18 +2387,47 @@
 				osc.start(ctx.currentTime + n.start);
 				osc.stop(ctx.currentTime + n.start + n.dur + 0.05);
 			});
-			console.log(LOG_PREFIX + '[Sound] 🔔提示音已播放');
+			console.log(LOG_PREFIX + '[Notify] 🔔提示音已播放(' + (preset || settings.notifySoundPreset) + ')');
 		} catch (e) {
-			console.log(LOG_PREFIX + '[Sound] 播放失败:', e);
+			console.log(LOG_PREFIX + '[Notify] 播放失败:', e);
 		}
 	}
 
+	function notifyEvent(eventType, detail) {
+		const ev = NOTIFY_EVENTS[eventType];
+		if (!ev) return;
+		const settingKey = 'notifyOn' + eventType.charAt(0).toUpperCase() + eventType.slice(1);
+		// 检查该事件的通知开关
+		if (!settings[settingKey]) {
+			console.log(LOG_PREFIX + '[Notify] ⏭️' + ev.label + '通知已关闭，跳过');
+			return;
+		}
+		// 播放提示音（每种事件有默认音色，但用户可在设置中统一切换）
+		playNotifySound(ev.sound);
+		// 系统通知
+		if (settings.notifySystemEnabled) {
+			try {
+				if (Notification.permission === 'default') Notification.requestPermission();
+				if (Notification.permission === 'granted') {
+					const n = new Notification('Windsurf Better', {
+						body: ev.icon + ' ' + ev.label + (detail ? ' - ' + detail : ''),
+						icon: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">' + ev.icon + '</text></svg>',
+						silent: true,
+					});
+					setTimeout(() => n.close(), 5000);
+				}
+			} catch (e) { console.log(LOG_PREFIX + '[Notify] 系统通知失败:', e); }
+		}
+		console.log(LOG_PREFIX + '[Notify] 📢' + ev.icon + ' ' + ev.label + (detail ? ' (' + detail + ')' : ''));
+	}
+
 	function startNotificationSound() {
-		if (_completionObserver) { _completionObserver.disconnect(); _completionObserver = null; }
-		if (!settings.notificationSoundEnabled) return;
+		_completionActive = false;
+		_checkCompletionFn = null;
+		if (!settings.notifySoundEnabled) return;
 
 		const checkCompletion = () => {
-			if (!settings.notificationSoundEnabled) return;
+			if (!settings.notifySoundEnabled) return;
 
 			// 核心检测：仅 lucide-square（■ 停止图标）为AI生成中的可靠标志
 			// arrow-up + cursor-pointer = 用户输入了文字（排队发送），不是AI生成
@@ -2368,8 +2464,14 @@
 				// 取消待触发的提示音（防止square短暂消失又出现）
 				if (_pendingSoundTimer) { clearTimeout(_pendingSoundTimer); _pendingSoundTimer = null; }
 			} else if (_wasGenerating) {
-				// square 消失，但可能是排队发送等临时状态
-				// 延迟1.5秒确认，期间如果square重新出现则取消
+				// square 消失，但可能是配额耗尽/自动继续发送/排队发送等临时状态
+				// 关键修复2：自动继续发送"继续"时，square消失是AI暂停，不是完成
+				if (_autoContinueSending) {
+					console.log(LOG_PREFIX + '[Sound] ⏳square消失但自动继续正在发送，忽略');
+					_wasGenerating = false;
+					return;
+				}
+				// 延迟3秒确认（配额banner可能延迟渲染，1.5秒不够）
 				if (!_pendingSoundTimer) {
 					_pendingSoundTimer = setTimeout(() => {
 						// 再次确认square确实消失了
@@ -2378,24 +2480,334 @@
 						for (const btn of btns2) {
 							if (btn.querySelector('svg.lucide-square')) { stillGone = false; break; }
 						}
-						if (stillGone) {
-							console.log(LOG_PREFIX + '[Sound] 检测到AI回复完成，播放提示音');
-							playCompletionSound();
-							showCompletionNotification();
+						if (!stillGone) {
+							// square又出现了，不是完成
+							_wasGenerating = false;
+							_pendingSoundTimer = null;
+							return;
 						}
-						_wasGenerating = false;
-						_pendingSoundTimer = null;
-					}, 1500);
+						// 配额banner可能延迟渲染，再等1秒二次检查
+						const quotaCheck2 = detectQuotaExhausted();
+						if (quotaCheck2.detected) {
+							console.log(LOG_PREFIX + '[Notify] ⏳配额耗尽，跳过完成通知');
+							_wasGenerating = false;
+							_pendingSoundTimer = null;
+							return;
+						}
+						// 再等1秒做最终确认（banner可能很晚才渲染）
+						setTimeout(() => {
+							const quotaCheck3 = detectQuotaExhausted();
+							if (stillGone && !_autoContinueSending && !quotaCheck3.detected) {
+								console.log(LOG_PREFIX + '[Notify] 检测到AI回复完成');
+								notifyEvent('complete');
+							} else if (quotaCheck3.detected) {
+								console.log(LOG_PREFIX + '[Notify] ⏳最终确认：配额耗尽，跳过完成通知');
+							} else if (_autoContinueSending) {
+								console.log(LOG_PREFIX + '[Notify] ⏳自动继续发送中，跳过完成通知');
+							}
+							_wasGenerating = false;
+							_pendingSoundTimer = null;
+						}, 1000);
+					}, 3000);
 				}
 			}
 		};
 
-		_completionObserver = new MutationObserver(() => {
-			clearTimeout(window._wsCompletionTimer);
-			window._wsCompletionTimer = setTimeout(checkCompletion, 600);
-		});
-		_completionObserver.observe(document.body, { childList: true, subtree: true });
-		console.log(LOG_PREFIX + '[Sound] ✅完成提示音已启用');
+		_completionActive = true;
+		_checkCompletionFn = checkCompletion; // 保存闭包引用
+		console.log(LOG_PREFIX + '[Notify] ✅完成检测已启用');
+	}
+
+	function onCompletionMutation() {
+		if (!_completionActive || !settings.notifySoundEnabled) return;
+		clearTimeout(_completionTimer);
+		_completionTimer = setTimeout(() => {
+			if (_checkCompletionFn) _checkCompletionFn();
+		}, 600);
+	}
+
+	// ========== AI提问检测 ==========
+	// 当AI最后一条消息包含问句或请求用户输入时，触发通知提醒用户
+	let _lastQuestionStepIdx = -1; // 防止同一个step重复通知
+	let _aiQuestionCheckTimer = 0;
+
+	// AI提问关键词模式（中英文）
+	const AI_QUESTION_PATTERNS = [
+		// 直接问句
+		/\?{2,}/,                          // 多个问号（强调疑问）
+		/请问/,                            // 中文"请问"
+		/你需要我/,                         // "你需要我..."
+		/你希望/,                           // "你希望..."
+		/是否需要/,                         // "是否需要..."
+		/你想/,                             // "你想..."
+		/请提供/,                           // "请提供..."
+		/请确认/,                           // "请确认..."
+		/请选择/,                           // "请选择..."
+		/请告诉我/,                         // "请告诉我..."
+		/请输入/,                           // "请输入..."
+		/需要你/,                           // "需要你..."
+		/需要您/,                           // "需要您..."
+		/你想要/,                           // "你想要..."
+		/你更倾向/,                         // "你更倾向..."
+		/你偏好/,                           // "你偏好..."
+		/should i/i,                        // "Should I..."
+		/do you want/i,                     // "Do you want..."
+		/would you like/i,                  // "Would you like..."
+		/which.*would/i,                    // "Which...would..."
+		/could you provide/i,               // "Could you provide..."
+		/can you tell/i,                    // "Can you tell..."
+		/please provide/i,                  // "Please provide..."
+		/please confirm/i,                 // "Please confirm..."
+		/please specify/i,                  // "Please specify..."
+		/please choose/i,                   // "Please choose..."
+		/please enter/i,                    // "Please enter..."
+		/i need (your|you)/i,              // "I need your..."
+		/what (would|should|do) you/i,      // "What would/should/do you..."
+		/how would you/i,                   // "How would you..."
+		/let me know/i,                     // "Let me know..."
+		/waiting for (your|you|input)/i,    // "Waiting for your..."
+	];
+
+	// 检测AI最后一条消息是否在提问
+	function detectAiQuestion() {
+		if (!settings.notifyOnAiQuestion) return;
+		const allSteps = document.querySelectorAll('[data-step-index]');
+		if (allSteps.length === 0) return;
+
+		// 找最大step-index
+		let lastStep = null, maxIdx = -1;
+		for (const s of allSteps) {
+			const idx = parseInt(s.getAttribute('data-step-index') || '0');
+			if (idx > maxIdx) { maxIdx = idx; lastStep = s; }
+		}
+		if (!lastStep) return;
+
+		// 防重复：同一个step不重复检测
+		if (maxIdx <= _lastQuestionStepIdx) return;
+
+		const stepText = cleanText(lastStep.textContent || '');
+		// 排除配额耗尽的step（不需要用户输入，需要自动继续）
+		if (EXHAUST_KEYWORDS.some(kw => stepText.includes(kw))) return;
+
+		// 检查是否包含问句模式
+		const isQuestion = AI_QUESTION_PATTERNS.some(p => p.test(stepText));
+
+		// 也检测末尾是否以问号结束（简单但有效）
+		const lastChar = stepText.trim().slice(-1);
+		const endsWithQuestion = lastChar === '?' || lastChar === '？';
+
+		if (isQuestion || endsWithQuestion) {
+			_lastQuestionStepIdx = maxIdx;
+			// 提取问句摘要（取最后200字）
+			const summary = stepText.slice(-200);
+			console.log(LOG_PREFIX + '[AiQuestion] ❓检测到AI提问(step=' + maxIdx + '): "' + summary.substring(0, 80) + '..."');
+			notifyEvent('aiQuestion', summary.substring(0, 100));
+		}
+	}
+
+	// ========== 长时间等待自动继续 ==========
+	// 当AI停止生成（square消失）且无配额耗尽、无提问时，
+	// 可能是命令在后台运行导致AI等待，超时后自动发送"继续"
+	let _idleSince = 0;           // AI空闲起始时间
+	let _idleCheckTimer = null;   // 空闲检查定时器
+	let _lastIdleStepCount = 0;   // 上次空闲时的step数量
+	const IDLE_CONTINUE_THRESHOLD = 60000; // 60秒空闲后自动继续
+	const IDLE_CHECK_INTERVAL = 15000;     // 每15秒检查一次
+
+	function startIdleContinueMonitor() {
+		if (_idleCheckTimer) return;
+		_idleCheckTimer = setInterval(() => {
+			if (!settings.autoContinueEnabled) return;
+			if (_autoContinueSending || _quotaContinueCooldown) return;
+
+			// 检查AI是否正在生成（square图标）
+			let isGenerating = false;
+			for (const btn of document.querySelectorAll('button[type="submit"]')) {
+				const rect = btn.getBoundingClientRect();
+				if (rect.width === 0 || rect.height === 0) continue;
+				if (btn.querySelector('svg.lucide-square')) { isGenerating = true; break; }
+			}
+
+			const now = Date.now();
+			if (isGenerating) {
+				// AI正在生成，重置空闲计时
+				_idleSince = 0;
+				_lastIdleStepCount = 0;
+				return;
+			}
+
+			// AI不在生成
+			// 检查是否有配额耗尽（交给现有机制处理）
+			const quotaResult = detectQuotaExhausted();
+			if (quotaResult.detected) {
+				_idleSince = 0;
+				return;
+			}
+
+			// 检查用户是否正在输入
+			const inputEl = findInputEl();
+			if (inputEl) {
+				const inputText = (inputEl.textContent || inputEl.value || '').replace(/\u200B/g, '').trim();
+				if (inputText.length > 0 && inputText !== '继续') {
+					_idleSince = 0;
+					return;
+				}
+			}
+
+			// 检查是否有"Continue response"按钮（交给现有机制处理）
+			const btns = document.querySelectorAll('button, [role="button"]');
+			for (const btn of btns) {
+				const txt = (btn.textContent || '').trim();
+				if (txt === 'Continue response' || txt === '继续回复') {
+					_idleSince = 0;
+					return; // 交给现有截断检测
+				}
+			}
+
+			// 检查是否有step（无step说明还没开始对话）
+			const allSteps = document.querySelectorAll('[data-step-index]');
+			if (allSteps.length === 0) {
+				_idleSince = 0;
+				return;
+			}
+
+			// 检查AI是否在提问（提问时不自动继续，等用户回答）
+			let lastStep = null, maxIdx = -1;
+			for (const s of allSteps) {
+				const idx = parseInt(s.getAttribute('data-step-index') || '0');
+				if (idx > maxIdx) { maxIdx = idx; lastStep = s; }
+			}
+			if (lastStep) {
+				const stepText = cleanText(lastStep.textContent || '');
+				const isQuestion = AI_QUESTION_PATTERNS.some(p => p.test(stepText));
+				const lastChar = stepText.trim().slice(-1);
+				if (isQuestion || lastChar === '?' || lastChar === '？') {
+					_idleSince = 0;
+					return; // AI在提问，不自动继续
+				}
+			}
+
+			// 开始/累积空闲计时
+			if (_idleSince === 0) {
+				_idleSince = now;
+				_lastIdleStepCount = allSteps.length;
+				console.log(LOG_PREFIX + '[IdleContinue] ⏱️AI空闲开始计时');
+			}
+
+			const idleDuration = now - _idleSince;
+			if (idleDuration >= IDLE_CONTINUE_THRESHOLD) {
+				// 超过阈值，检查step数量是否没变化（确认是真的空闲）
+				if (allSteps.length === _lastIdleStepCount) {
+					console.log(LOG_PREFIX + '[IdleContinue] ⏰AI已空闲' + Math.round(idleDuration / 1000) + '秒，自动发送"继续"');
+					// 使用现有的发送机制
+					_autoContinueSending = true;
+					const ok = setInputText('继续');
+					if (!ok) {
+						console.log(LOG_PREFIX + '[IdleContinue] 找不到输入框，放弃');
+						_autoContinueSending = false;
+						_idleSince = 0;
+						return;
+					}
+					// 点击发送
+					setTimeout(() => {
+						for (const btn of document.querySelectorAll('button[type="submit"]')) {
+							const rect = btn.getBoundingClientRect();
+							if (rect.width === 0 || rect.height === 0) continue;
+							const arrowSvg = btn.querySelector('svg.lucide-arrow-up');
+							if (!arrowSvg) continue;
+							if (btn.classList.contains('cursor-not-allowed') || btn.classList.contains('opacity-50')) continue;
+							btn.click();
+							console.log(LOG_PREFIX + '[IdleContinue] 📤已点击submit按钮');
+							break;
+						}
+					}, 300);
+					// 验证发送
+					setTimeout(() => {
+						const inputEl2 = findInputEl();
+						if (inputEl2) {
+							const textAfter = (inputEl2.textContent || inputEl2.value || '').replace(/\u200B/g, '').trim();
+							if (textAfter === '继续') {
+								console.log(LOG_PREFIX + '[IdleContinue] ❌空闲继续发送失败');
+							} else {
+								console.log(LOG_PREFIX + '[IdleContinue] ✅空闲继续发送成功');
+								notifyEvent('autoContinue', 'AI长时间空闲，已自动发送"继续"');
+							}
+						}
+						_autoContinueSending = false;
+						_idleSince = 0;
+						// 冷却30秒
+						_quotaContinueCooldown = true;
+						setTimeout(() => { _quotaContinueCooldown = false; }, 30000);
+					}, 1000);
+				} else {
+					// step数量变了，AI可能已经开始新回复，重置
+					_idleSince = 0;
+					_lastIdleStepCount = allSteps.length;
+				}
+			} else {
+				console.log(LOG_PREFIX + '[IdleContinue] ⏳AI已空闲' + Math.round(idleDuration / 1000) + '秒/' + Math.round(IDLE_CONTINUE_THRESHOLD / 1000) + '秒');
+			}
+		}, IDLE_CHECK_INTERVAL);
+		console.log(LOG_PREFIX + '[IdleContinue] ✅空闲继续监控已启动(阈值=' + Math.round(IDLE_CONTINUE_THRESHOLD / 1000) + '秒)');
+	}
+
+	// ========== 配额余额检查 ==========
+	// 在自动继续发送"继续"之前，检查是否真的还有余额
+	// 如果配额真的耗尽（无余额），发送"继续"也只会浪费请求
+	const QUOTA_LOW_KEYWORDS = [
+		'quota is exhausted',
+		'usage quota is exhausted',
+		'配额已用完',
+		'每日配额已用完',
+		'每周配额已用完',
+		'purchase additional usage',
+		'购买额外使用量',
+		'upgrade to continue',
+		'no remaining quota',
+		'quota exceeded',
+	];
+
+	// 检测配额是否真的耗尽（无余额可继续）
+	// 与detectQuotaExhausted()不同，此函数用于判断是否应该放弃自动继续
+	function isQuotaTrulyExhausted() {
+		const quotaResult = detectQuotaExhausted();
+		if (!quotaResult.detected) return false;
+
+		// 检查banner/step文本中是否包含"购买"、"升级"等关键词
+		// 这些词表明配额真的用完了，不是临时中断
+		const text = quotaResult.text || '';
+		const isTrulyExhausted = QUOTA_LOW_KEYWORDS.some(kw => text.includes(kw));
+
+		if (isTrulyExhausted) {
+			console.log(LOG_PREFIX + '[QuotaCheck] 🚫配额真正耗尽，不应继续发送: "' + text.substring(0, 80) + '"');
+			return true;
+		}
+
+		// 检查是否有"Continue response"按钮 — 如果有，说明还有余额
+		const btns = document.querySelectorAll('button, [role="button"]');
+		for (const btn of btns) {
+			const txt = (btn.textContent || '').trim();
+			if (txt === 'Continue response' || txt === '继续回复') {
+				console.log(LOG_PREFIX + '[QuotaCheck] ✅有"Continue response"按钮，余额可能还有');
+				return false;
+			}
+		}
+
+		// 检查submit按钮是否可用（可点击=可能有余额）
+		for (const btn of document.querySelectorAll('button[type="submit"]')) {
+			const rect = btn.getBoundingClientRect();
+			if (rect.width === 0 || rect.height === 0) continue;
+			if (!btn.classList.contains('cursor-not-allowed') && !btn.classList.contains('opacity-50')) {
+				if (btn.querySelector('svg.lucide-arrow-up')) {
+					console.log(LOG_PREFIX + '[QuotaCheck] ✅submit按钮可用，余额可能还有');
+					return false;
+				}
+			}
+		}
+
+		// 默认：配额耗尽但不确定是否有余额，允许尝试一次
+		console.log(LOG_PREFIX + '[QuotaCheck] ⚠️配额耗尽但无法确定余额，允许尝试一次');
+		return false;
 	}
 
 	function dismissCorruptWarning() {
@@ -2419,10 +2831,35 @@
 	// ========== 初始化 ==========
 	function init() {
 		console.log('🚀 Windsurf Better v' + VERSION + ' 初始化');
-		createSettingsUI();
-		dismissCorruptWarning();
-		if (settings.autoContinueEnabled) startAutoContinue();
-		if (settings.notificationSoundEnabled) startNotificationSound();
+		window.__wsBetterVersion = VERSION; // 全局标记，方便排查
+
+		// 启动时清除所有旧的 ws-quota-handled-* 键
+		// 这些键可能是之前发送失败时设置的，会阻止自动继续重试
+		try {
+			const toRemove = [];
+			for (let i = 0; i < localStorage.length; i++) {
+				const k = localStorage.key(i);
+				if (k && k.startsWith('ws-quota-handled-')) toRemove.push(k);
+			}
+			if (toRemove.length > 0) {
+				for (const k of toRemove) localStorage.removeItem(k);
+				console.log(LOG_PREFIX + '[Init] 清除了' + toRemove.length + '个旧的quota-handled键');
+			}
+		} catch (e) { console.log(LOG_PREFIX + '[Init] 清理handledKey异常:', e.message); }
+
+		// 设置UI已迁移到Extension侧边栏，不再在此创建
+		// 注入气泡样式（之前由createSettingsUI调用，现在独立调用）
+		try { injectBubblesStyles(); } catch (e) { console.error(LOG_PREFIX + '[Init] injectBubblesStyles失败:', e); }
+
+		try {
+			dismissCorruptWarning();
+		} catch (e) { console.error(LOG_PREFIX + '[Init] ❌dismissCorruptWarning失败:', e); }
+
+		// 启动统一观察器（替代5个独立观察器）
+		startUnifiedObserver();
+
+		if (settings.autoContinueEnabled) { startAutoContinue(); startIdleContinueMonitor(); }
+		if (settings.notifySoundEnabled) startNotificationSound();
 		if (settings.chatQueueEnabled) startChatQueueObserver();
 		
 		// 启动气泡功能
@@ -2442,6 +2879,8 @@
 						}
 					});
 					obs.observe(document.body, { childList: true, subtree: true });
+					// 30秒后如果还没找到聊天面板，断开观察器避免泄漏
+					setTimeout(() => { if (obs) obs.disconnect(); }, 30000);
 					logBubbles('⏳等待聊天面板...');
 				}
 			};

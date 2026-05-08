@@ -1,0 +1,40 @@
+{
+	"name": "windsurf-better",
+	"displayName": "Windsurf Better",
+	"description": "气泡提示 + 汉化 + 自动继续 + 配额检测",
+	"version": "1.4.4",
+	"publisher": "windsurf-better",
+	"engines": {
+		"vscode": "^1.71.0"
+	},
+	"categories": ["AI", "Other"],
+	"activationEvents": ["onStartupFinished"],
+	"main": "./dist/extension.js",
+	"contributes": {
+		"viewsContainers": {
+			"activitybar": [
+				{
+					"id": "windsurf-better",
+					"title": "Windsurf Better",
+					"icon": "resources/icon.svg"
+				}
+			]
+		},
+		"views": {
+			"windsurf-better": [
+				{
+					"id": "windsurf-better.panel",
+					"name": "控制面板",
+					"type": "webview"
+				}
+			]
+		},
+		"commands": [
+			{
+				"command": "windsurf-better.reloadWindow",
+				"title": "重载窗口 (加载新插件代码)",
+				"category": "Windsurf Better"
+			}
+		]
+	}
+}
